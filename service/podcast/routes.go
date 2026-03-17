@@ -98,12 +98,14 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	episodes, err := h.feedService.GetFeed(podcast.FeedURL)
+	feedsResp, err := h.feedService.GetFeed(podcast.FeedURL)
 
 	if err != nil {
 		utils.WriteJson(res, http.StatusInternalServerError, err.Error())
 		return
 	}
+
+	episodes := feedsResp.Channel.Item
 
 	utils.WriteJson(res, http.StatusOK, episodes)
 }

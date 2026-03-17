@@ -6,3 +6,5 @@ github.com/shanejwalsh/itunes-xml-parser v0.0.2 h1:3PUmZ1CiObLHrhEjSrhSL0MlZRm4W
 github.com/shanejwalsh/itunes-xml-parser v0.0.2/go.mod h1:3uTz91uoFCeTvyaRLT3K3VCCs/AYuhO2ZN/t81pzUsw=
 github.com/shanejwalsh/itunes-xml-parser v0.0.4 h1:OkhMLucgvi/duWSs/B+HY3Lau/xCB97hVPVNicQYu8k=
 github.com/shanejwalsh/itunes-xml-parser v0.0.4/go.mod h1:3uTz91uoFCeTvyaRLT3K3VCCs/AYuhO2ZN/t81pzUsw=
+github.com/shanejwalsh/itunes-xml-parser v0.0.5 h1:dbZKH1q9cj0n/UnH5QeE2TFYg9nRHnqaa6yxmKVR6+g=
+github.com/shanejwalsh/itunes-xml-parser v0.0.5/go.mod h1:3uTz91uoFCeTvyaRLT3K3VCCs/AYuhO2ZN/t81pzUsw=
