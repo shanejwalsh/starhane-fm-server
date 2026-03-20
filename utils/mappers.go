@@ -2,7 +2,6 @@ package utils
 
 import (
 	"strconv"
-
 	"github.com/shanejwalsh/itunes-xml-parser/itunes"
 	"github.com/shanejwalsh/starhane-fm-server/types"
 )
