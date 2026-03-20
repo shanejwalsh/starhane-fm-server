@@ -2,15 +2,12 @@ package main
 
 import (
 	"fmt"
-
 	"github.com/shanejwalsh/starhane-fm-server/cmd/api"
 )
 
 func main() {
-    port := os.Getenv("PORT") || "8000"
-    // if port == "" {
-    //     port = "8000"
-    // }
+    port := "8000"
+
 
     fmt.Println("Starting server on port:", port)
 
