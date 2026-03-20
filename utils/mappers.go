@@ -39,5 +39,6 @@ func MapToEpisodeResponse(item *feeds.Episode) types.EpisodeResponse {
 		PubDate:     item.PubDate,
 		Link:        item.Link,
 		IsExplicit:  isExplicit,
+		Duration:    item.Duration,
 	}
 }
