@@ -7,12 +7,17 @@ import (
 )
 
 func main() {
+    port := os.Getenv("PORT")
+    if port == "" {
+        port = "8000"
+    }
 
-	server := api.NewAPIServer("8000")
+    fmt.Println("Starting server on port:", port)
 
-	err := server.Start()
-	if err != nil {
-		fmt.Println("Failed to start server:", err)
-		return
-	}
+    server := api.NewAPIServer(port)
+    err := server.Start()
+    if err != nil {
+        fmt.Println("Failed to start server:", err)
+        return
+    }
 }
