@@ -1,4 +1,0 @@
-{
-  "buildCommand": "go build -o ./bin/starhane-fm-server cmd/main.go",
-  "startCommand": "./bin/starhane-fm-server"
-}
