@@ -14,8 +14,8 @@ import (
 )
 
 const (
-	SERVICE_PATH  = "/podcasts"
 	INDEX_PATH    = "/"
+	SERVICE_PATH  = "/podcasts"
 	PODCAST_PATH  = "/{podcastId}"
 	EPISODES_PATH = "/{podcastId}/episodes"
 )
