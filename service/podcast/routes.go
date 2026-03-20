@@ -108,8 +108,8 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 	episodes := make([]types.EpisodeResponse, len(feedsResp.Channel.Item))
 
 	for i, item := range feedsResp.Channel.Item {
-        episodes[i] = utils.MapEpisodeResponse(&item)
-    }
+		episodes[i] = utils.MapToEpisodeResponse(&item)
+	}
 
 	utils.WriteJson(res, http.StatusOK, episodes)
 }
