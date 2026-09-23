@@ -110,7 +110,7 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 
 	if err != nil {
 		logger.WarnContext(ctx, "invalid podcast id", slog.Any("error", err))
-		utils.WriteJson(res, http.StatusInternalServerError, err.Error())
+		utils.WriteJson(res, http.StatusBadRequest, err.Error())
 		return
 	}
 

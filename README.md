@@ -116,7 +116,8 @@ GET /api/v1/podcasts/1234567
 
 **Errors**
 
-- `404 Not Found` — no podcast (or more than one) found for the given ID, or `podcastId` isn't a valid integer.
+- `400 Bad Request` — `podcastId` isn't a valid integer.
+- `404 Not Found` — no podcast (or more than one) found for the given ID.
 
 ---
 
@@ -158,7 +159,8 @@ GET /api/v1/podcasts/1234567/episodes
 
 **Errors**
 
-- `500 Internal Server Error` — `podcastId` isn't a valid integer, or the RSS feed request/parse failed.
+- `400 Bad Request` — `podcastId` isn't a valid integer.
+- `500 Internal Server Error` — the RSS feed request/parse failed.
 - `404 Not Found` — no podcast (or more than one) found for the given ID.
 
 ## Project layout
