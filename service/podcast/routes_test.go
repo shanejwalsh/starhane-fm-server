@@ -404,3 +404,73 @@ func TestSearchPathRedirectsToTrailingSlash(t *testing.T) {
 		t.Errorf("Location = %q, want the trailing-slash form", location)
 	}
 }
+
+func TestIsPodcast(t *testing.T) {
+	cases := map[string]struct {
+		result itunes.Result
+		want   bool
+	}{
+		"podcast from search": {
+			itunes.Result{CollectionID: 1, Kind: "podcast", FeedURL: "https://example.com/f.xml"}, true,
+		},
+		"podcast from lookup": {
+			itunes.Result{CollectionID: 1, WrapperType: "track", Kind: "podcast"}, true,
+		},
+		"collection with a feed but no kind": {
+			itunes.Result{CollectionID: 1, FeedURL: "https://example.com/f.xml"}, true,
+		},
+		// An artist ID resolves fine but carries no collectionId and no feed.
+		// Storing it would key a row on 0, which every other non-podcast would
+		// then collide with.
+		"artist": {
+			itunes.Result{WrapperType: "artist", ArtistName: "Someone"}, false,
+		},
+		"album": {
+			itunes.Result{CollectionID: 5, WrapperType: "collection", Kind: "album"}, false,
+		},
+	}
+
+	for name, tc := range cases {
+		if got := isPodcast(&tc.result); got != tc.want {
+			t.Errorf("%s: isPodcast = %v, want %v", name, got, tc.want)
+		}
+	}
+}
+
+func TestNonPodcastIdIsNotStored(t *testing.T) {
+	// iTunes returns one result, but it is an artist rather than a podcast.
+	ias := &fakeItunes{response: itunes.SearchResponse{
+		ResultCount: 1,
+		Results:     []itunes.Result{{WrapperType: "artist", ArtistName: "Someone"}},
+	}}
+	catalogue := &fakeCatalogue{lookupErr: pgx.ErrNoRows}
+
+	rec := get(t, newTestHandler(ias, catalogue, &fakeCrawler{}), "/api/v1/podcasts/1305204570/episodes")
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Errorf("status = %d, want 500", rec.Code)
+	}
+	if len(catalogue.upserted) != 0 {
+		t.Errorf("stored %+v, want nothing — an artist is not a podcast", catalogue.upserted)
+	}
+}
+
+func TestSearchResultsThatAreNotPodcastsAreNotStored(t *testing.T) {
+	ias := &fakeItunes{response: itunes.SearchResponse{
+		ResultCount: 2,
+		Results:     []itunes.Result{sampleResult(), {WrapperType: "artist", ArtistName: "Someone"}},
+	}}
+	catalogue := &fakeCatalogue{}
+
+	rec := get(t, newTestHandler(ias, catalogue, &fakeCrawler{}), "/api/v1/podcasts/?searchTerm=test")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if len(catalogue.upserted) != 1 {
+		t.Fatalf("stored %d rows, want only the real podcast", len(catalogue.upserted))
+	}
+	if catalogue.upserted[0].ItunesID != 1234567 {
+		t.Errorf("stored itunes id %d, want 1234567", catalogue.upserted[0].ItunesID)
+	}
+}

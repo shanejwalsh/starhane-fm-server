@@ -244,6 +244,12 @@ func (h *Handler) resolveFeed(ctx context.Context, logger *slog.Logger, itunesID
 	if err != nil {
 		return nil, err
 	}
+	if !isPodcast(result) {
+		// An iTunes ID that belongs to an artist or an album resolves fine but
+		// has no feed. Storing it would put a row keyed on collectionId 0 in
+		// the catalogue, which every other non-podcast would then collide with.
+		return nil, errNoFeed
+	}
 
 	_, upserted, err := h.catalogue.UpsertPodcastWithFeed(ctx, utils.MapPodcastUpsert(result))
 	if err != nil {
@@ -253,6 +259,17 @@ func (h *Handler) resolveFeed(ctx context.Context, logger *slog.Logger, itunesID
 		return nil, errNoFeed
 	}
 	return upserted, nil
+}
+
+// isPodcast reports whether an iTunes result is a podcast worth cataloguing.
+//
+// Search pins entity=podcast, but a lookup will happily resolve an artist or an
+// album ID, and those come back with no collectionId and no feed URL.
+func isPodcast(result *itunes.Result) bool {
+	if result.CollectionID == 0 {
+		return false
+	}
+	return result.Kind == "podcast" || result.FeedURL != ""
 }
 
 // crawlColdFeed crawls a feed the catalogue has never filled, so the first
@@ -292,7 +309,13 @@ func (h *Handler) rememberPodcasts(ctx context.Context, logger *slog.Logger, res
 
 	upserts := make([]store.PodcastUpsert, 0, len(results))
 	for i := range results {
+		if !isPodcast(&results[i]) {
+			continue
+		}
 		upserts = append(upserts, utils.MapPodcastUpsert(&results[i]))
+	}
+	if len(upserts) == 0 {
+		return
 	}
 
 	if err := h.catalogue.UpsertPodcasts(ctx, upserts); err != nil {
