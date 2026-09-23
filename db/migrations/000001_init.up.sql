@@ -69,7 +69,7 @@ CREATE TABLE episodes (
     feed_id        bigint      NOT NULL REFERENCES feeds (id) ON DELETE CASCADE,
     guid           text        NOT NULL,
     guid_source    text        NOT NULL DEFAULT 'guid'
-                       CHECK (guid_source IN ('guid', 'enclosure_hash')),
+                       CHECK (guid_source IN ('guid', 'enclosure_hash', 'derived')),
 
     title          text        NOT NULL DEFAULT '',
     description    text        NOT NULL DEFAULT '',

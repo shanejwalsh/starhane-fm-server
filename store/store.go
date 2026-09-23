@@ -32,6 +32,9 @@ const (
 	// GuidFromEnclosureHash means <guid> was missing or repeated within the
 	// document, so a hash of the enclosure URL was used instead.
 	GuidFromEnclosureHash = "enclosure_hash"
+	// GuidDerived means there was no usable <guid> and no enclosure URL
+	// either, so the key came from the item's own content.
+	GuidDerived = "derived"
 )
 
 // Store runs queries against a Postgres pool.

@@ -8,10 +8,13 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
-const episodeColumns = `id, feed_id, guid, guid_source, title, description, audio_url,
-	audio_length, audio_type, author, pub_date, pub_date_raw, link, explicit, duration,
-	episode_no, season_no, episode_type, image_url, position, last_crawl_seq,
-	first_seen_at, last_seen_at, updated_at`
+// episodeColumns is qualified with the table alias "e" because the only query
+// that selects episodes joins feeds, where id, feed_id and updated_at would
+// otherwise be ambiguous.
+const episodeColumns = `e.id, e.feed_id, e.guid, e.guid_source, e.title, e.description,
+	e.audio_url, e.audio_length, e.audio_type, e.author, e.pub_date, e.pub_date_raw, e.link,
+	e.explicit, e.duration, e.episode_no, e.season_no, e.episode_type, e.image_url,
+	e.position, e.last_crawl_seq, e.first_seen_at, e.last_seen_at, e.updated_at`
 
 // EpisodeUpsert is one episode as parsed from a feed, ready to be written.
 type EpisodeUpsert struct {
