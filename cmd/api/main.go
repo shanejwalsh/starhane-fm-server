@@ -1,11 +1,12 @@
+// Command api serves the HTTP API.
 package main
 
 import (
 	"log/slog"
 	"os"
 
-	"github.com/shanejwalsh/starhane-fm-server/cmd/api"
 	"github.com/shanejwalsh/starhane-fm-server/logging"
+	"github.com/shanejwalsh/starhane-fm-server/server"
 )
 
 func main() {
@@ -14,8 +15,8 @@ func main() {
 
 	port := "8000"
 
-	server := api.NewAPIServer(port, logger)
-	if err := server.Start(); err != nil {
+	srv := server.NewAPIServer(port, logger)
+	if err := srv.Start(); err != nil {
 		logger.Error("server stopped", slog.Any("error", err))
 		os.Exit(1)
 	}
