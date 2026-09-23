@@ -1,20 +1,22 @@
 package main
 
 import (
-	"fmt"
+	"log/slog"
+	"os"
 
 	"github.com/shanejwalsh/starhane-fm-server/cmd/api"
+	"github.com/shanejwalsh/starhane-fm-server/logging"
 )
 
 func main() {
+	logger := logging.New(os.Stdout, logging.ConfigFromEnv())
+	slog.SetDefault(logger)
+
 	port := "8000"
 
-	fmt.Println("Starting server on port:", port)
-
-	server := api.NewAPIServer(port)
-	err := server.Start()
-	if err != nil {
-		fmt.Println("Failed to start server:", err)
-		return
+	server := api.NewAPIServer(port, logger)
+	if err := server.Start(); err != nil {
+		logger.Error("server stopped", slog.Any("error", err))
+		os.Exit(1)
 	}
 }

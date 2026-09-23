@@ -23,6 +23,26 @@ docker build -t starhane-fm-server .
 docker run -p 8000:8000 starhane-fm-server
 ```
 
+## Logging
+
+The server uses structured logging via the standard library's
+[`log/slog`](https://pkg.go.dev/log/slog). Every request is logged once on
+completion with its method, path, status, bytes written and duration, and is
+tagged with a `request_id` (taken from an incoming `X-Request-ID` header, or
+generated, and echoed back in the response). Panics in handlers are recovered
+and logged with a stack trace.
+
+Configure it with environment variables:
+
+| Variable     | Values                           | Default |
+|--------------|----------------------------------|---------|
+| `LOG_LEVEL`  | `debug`, `info`, `warn`, `error` | `info`  |
+| `LOG_FORMAT` | `json`, `text`                   | `json`  |
+
+```bash
+LOG_LEVEL=debug LOG_FORMAT=text make dev
+```
+
 ## Base URL
 
 All routes are mounted under:
@@ -96,7 +116,8 @@ GET /api/v1/podcasts/1234567
 
 **Errors**
 
-- `404 Not Found` — no podcast (or more than one) found for the given ID, or `podcastId` isn't a valid integer.
+- `400 Bad Request` — `podcastId` isn't a valid integer.
+- `404 Not Found` — no podcast (or more than one) found for the given ID.
 
 ---
 
@@ -138,7 +159,8 @@ GET /api/v1/podcasts/1234567/episodes
 
 **Errors**
 
-- `500 Internal Server Error` — `podcastId` isn't a valid integer, or the RSS feed request/parse failed.
+- `400 Bad Request` — `podcastId` isn't a valid integer.
+- `500 Internal Server Error` — the RSS feed request/parse failed.
 - `404 Not Found` — no podcast (or more than one) found for the given ID.
 
 ## Project layout
@@ -147,6 +169,7 @@ GET /api/v1/podcasts/1234567/episodes
 cmd/
   main.go        entrypoint, starts the API server on port 8000
   api/api.go      server setup: router, CORS, middleware, route registration
+logging/          slog setup, request-logging middleware, context helpers
 service/
   podcast/routes.go   podcast route handlers
 types/            response/domain types (Podcast, Episode, EpisodeResponse)

@@ -2,6 +2,7 @@ package podcast
 
 import (
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strconv"
 
@@ -9,6 +10,7 @@ import (
 	"github.com/shanejwalsh/itunes-xml-parser/feeds"
 	"github.com/shanejwalsh/itunes-xml-parser/itunes"
 
+	"github.com/shanejwalsh/starhane-fm-server/logging"
 	"github.com/shanejwalsh/starhane-fm-server/types"
 	"github.com/shanejwalsh/starhane-fm-server/utils"
 )
@@ -51,6 +53,10 @@ func (h *Handler) getPodcasts(res http.ResponseWriter, req *http.Request) {
 	itunesRes, err := h.itunesParserService.Search(searchTerm)
 
 	if err != nil {
+		logging.FromContext(req.Context()).ErrorContext(req.Context(), "itunes search failed",
+			slog.String("search_term", searchTerm),
+			slog.Any("error", err),
+		)
 		utils.WriteJson(res, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -61,16 +67,24 @@ func (h *Handler) getPodcasts(res http.ResponseWriter, req *http.Request) {
 		podcasts[i] = utils.MapPodcast(&podcast)
 	}
 
+	logging.FromContext(req.Context()).DebugContext(req.Context(), "itunes search succeeded",
+		slog.String("search_term", searchTerm),
+		slog.Int("results", len(podcasts)),
+	)
+
 	utils.WriteJson(res, http.StatusOK, podcasts)
 }
 
 func (h *Handler) getPodcast(res http.ResponseWriter, req *http.Request) {
 
+	ctx := req.Context()
 	vars := mux.Vars(req)
 	podcastId := vars["podcastId"]
+	logger := logging.FromContext(ctx).With(slog.String("podcast_id", podcastId))
 	parsedId, err := strconv.Atoi(podcastId)
 
 	if err != nil {
+		logger.WarnContext(ctx, "invalid podcast id", slog.Any("error", err))
 		utils.WriteJson(res, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -78,6 +92,7 @@ func (h *Handler) getPodcast(res http.ResponseWriter, req *http.Request) {
 	podcast, err := h.lookupPodcast(parsedId)
 
 	if err != nil {
+		logger.WarnContext(ctx, "podcast lookup failed", slog.Any("error", err))
 		utils.WriteJson(res, http.StatusNotFound, err.Error())
 		return
 	}
@@ -87,18 +102,22 @@ func (h *Handler) getPodcast(res http.ResponseWriter, req *http.Request) {
 
 func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 
+	ctx := req.Context()
 	vars := mux.Vars(req)
 	podcastId := vars["podcastId"]
+	logger := logging.FromContext(ctx).With(slog.String("podcast_id", podcastId))
 	parsedId, err := strconv.Atoi(podcastId)
 
 	if err != nil {
-		utils.WriteJson(res, http.StatusInternalServerError, err.Error())
+		logger.WarnContext(ctx, "invalid podcast id", slog.Any("error", err))
+		utils.WriteJson(res, http.StatusBadRequest, err.Error())
 		return
 	}
 
 	podcast, err := h.lookupPodcast(parsedId)
 
 	if err != nil {
+		logger.WarnContext(ctx, "podcast lookup failed", slog.Any("error", err))
 		utils.WriteJson(res, http.StatusNotFound, err.Error())
 		return
 	}
@@ -106,6 +125,10 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 	feedsResp, err := h.feedService.GetFeed(podcast.FeedURL)
 
 	if err != nil {
+		logger.ErrorContext(ctx, "fetching rss feed failed",
+			slog.String("feed_url", podcast.FeedURL),
+			slog.Any("error", err),
+		)
 		utils.WriteJson(res, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -115,6 +138,8 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 	for i, item := range feedsResp.Channel.Item {
 		episodes[i] = utils.MapToEpisodeResponse(&item)
 	}
+
+	logger.DebugContext(ctx, "rss feed parsed", slog.Int("episodes", len(episodes)))
 
 	utils.WriteJson(res, http.StatusOK, episodes)
 }
