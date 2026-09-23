@@ -55,7 +55,7 @@ func (h *Handler) getPodcasts(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	podcasts := make([]types.Podcast, itunesRes.ResultCount)
+	podcasts := make([]types.Podcast, len(itunesRes.Results))
 
 	for i, podcast := range itunesRes.Results {
 		podcasts[i] = utils.MapPodcast(&podcast)
@@ -69,6 +69,11 @@ func (h *Handler) getPodcast(res http.ResponseWriter, req *http.Request) {
 	vars := mux.Vars(req)
 	podcastId := vars["podcastId"]
 	parsedId, err := strconv.Atoi(podcastId)
+
+	if err != nil {
+		utils.WriteJson(res, http.StatusBadRequest, err.Error())
+		return
+	}
 
 	podcast, err := h.lookupPodcast(parsedId)
 

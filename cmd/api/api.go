@@ -25,7 +25,7 @@ func (s *APIServer) Start() error {
 
 	cors := cors.New(cors.Options{
 		AllowedOrigins:   []string{"*"},
-		AllowCredentials: true,
+		AllowCredentials: false,
 	})
 
 	router := mux.NewRouter()
