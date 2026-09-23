@@ -1,23 +1,26 @@
 package api
 
 import (
-	"log"
+	"log/slog"
 	"net/http"
 
 	"github.com/gorilla/mux"
 	"github.com/rs/cors"
 	"github.com/shanejwalsh/itunes-xml-parser/feeds"
 	"github.com/shanejwalsh/itunes-xml-parser/itunes"
+	"github.com/shanejwalsh/starhane-fm-server/logging"
 	"github.com/shanejwalsh/starhane-fm-server/service/podcast"
 )
 
 type APIServer struct {
-	port string
+	port   string
+	logger *slog.Logger
 }
 
-func NewAPIServer(port string) *APIServer {
+func NewAPIServer(port string, logger *slog.Logger) *APIServer {
 	return &APIServer{
-		port: port,
+		port:   port,
+		logger: logger,
 	}
 }
 
@@ -30,9 +33,6 @@ func (s *APIServer) Start() error {
 
 	router := mux.NewRouter()
 
-	corsHandler := cors.Handler(router)
-	router.Use(loggingMiddleware)
-
 	subrouter := router.PathPrefix("/api/v1").Subrouter()
 
 	subrouter.StrictSlash(true)
@@ -44,14 +44,17 @@ func (s *APIServer) Start() error {
 
 	podcastHandler.RegisterRoutes(subrouter)
 
-	log.Println("listening on PORT", s.port)
+	// Wrap the whole stack (rather than router.Use) so unmatched routes and
+	// CORS preflight requests are logged too.
+	handler := logging.Middleware(s.logger)(cors.Handler(router))
 
-	return http.ListenAndServe(":"+s.port, corsHandler)
-}
+	server := &http.Server{
+		Addr:     ":" + s.port,
+		Handler:  handler,
+		ErrorLog: slog.NewLogLogger(s.logger.Handler(), slog.LevelError),
+	}
 
-func loggingMiddleware(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Printf("%s %s %s", r.RemoteAddr, r.Method, r.URL.Path)
-		next.ServeHTTP(w, r)
-	})
+	s.logger.Info("starting server", slog.String("addr", server.Addr))
+
+	return server.ListenAndServe()
 }
