@@ -69,17 +69,20 @@ hashing possible, so do not reintroduce `feeds.GetFeed` in the crawl path.
    ties handler logs to the request-completed summary line.
 2. Log level maps to response class: 4xx → `Warn`, 5xx → `Error`, success detail
    → `Debug`.
-3. `logging.Middleware` wraps the **entire** stack including CORS and the router
+3. To report something on the request summary line, call `logging.Annotate` /
+   `logging.AnnotateCache` rather than emitting a second line. The middleware
+   collects them and writes one line per request.
+4. `logging.Middleware` wraps the **entire** stack including CORS and the router
    (deliberately, not `router.Use`) so unmatched routes and preflights are
    logged too.
-4. Route paths are consts at the top of `service/podcast/routes.go`.
-5. Pass `context.Context` to every query and every outbound request.
-6. Existing error paths write a bare JSON string
+5. Route paths are consts at the top of `service/podcast/routes.go`.
+6. Pass `context.Context` to every query and every outbound request.
+7. Existing error paths write a bare JSON string
    (`utils.WriteJson(res, status, err.Error())`). That leaks upstream error text
    and `utils.WriteError` wraps errors as `{"error": ...}` instead — prefer it
    for new endpoints, but do not retrofit the three existing ones without
    deciding to change the public contract.
-7. Never download, proxy or re-host audio. Only enclosure URLs are stored.
+8. Never download, proxy or re-host audio. Only enclosure URLs are stored.
 
 ## Things that exist for a reason
 

@@ -1,6 +1,7 @@
 package podcast
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -472,5 +473,92 @@ func TestSearchResultsThatAreNotPodcastsAreNotStored(t *testing.T) {
 	}
 	if catalogue.upserted[0].ItunesID != 1234567 {
 		t.Errorf("stored itunes id %d, want 1234567", catalogue.upserted[0].ItunesID)
+	}
+}
+
+// annotatedGet drives a request and returns the attributes the handler reported
+// for the summary line.
+func annotatedGet(t *testing.T, handler http.Handler, path string) map[string]any {
+	t.Helper()
+
+	var buf bytes.Buffer
+	logger := logging.New(&buf, logging.Config{Level: "debug", Format: "json"})
+	wrapped := logging.Middleware(logger)(handler)
+
+	wrapped.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, path, nil))
+
+	lines := bytes.Split(bytes.TrimSpace(buf.Bytes()), []byte("\n"))
+	var summary map[string]any
+	if err := json.Unmarshal(lines[len(lines)-1], &summary); err != nil {
+		t.Fatalf("decoding summary line: %v\n%s", err, buf.String())
+	}
+	return summary
+}
+
+func TestEpisodesReportsCacheOutcome(t *testing.T) {
+	cases := []struct {
+		name       string
+		ias        *fakeItunes
+		catalogue  *fakeCatalogue
+		crawler    *fakeCrawler
+		wantCache  string
+		wantReason string
+	}{
+		{
+			name:      "everything already catalogued",
+			ias:       &fakeItunes{},
+			catalogue: &fakeCatalogue{feed: sampleFeed(true), episodes: []store.Episode{{Guid: "a"}}},
+			crawler:   &fakeCrawler{},
+			wantCache: "hit",
+		},
+		{
+			name: "podcast not known yet",
+			ias: &fakeItunes{response: itunes.SearchResponse{
+				ResultCount: 1, Results: []itunes.Result{sampleResult()},
+			}},
+			catalogue:  &fakeCatalogue{lookupErr: pgx.ErrNoRows, feed: sampleFeed(true)},
+			crawler:    &fakeCrawler{},
+			wantCache:  "miss",
+			wantReason: "unknown_podcast",
+		},
+		{
+			name:       "known podcast, feed never crawled",
+			ias:        &fakeItunes{},
+			catalogue:  &fakeCatalogue{feed: sampleFeed(false)},
+			crawler:    &fakeCrawler{},
+			wantCache:  "miss",
+			wantReason: "uncrawled_feed",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			handler := newTestHandler(tc.ias, tc.catalogue, tc.crawler)
+			summary := annotatedGet(t, handler, "/api/v1/podcasts/1234567/episodes")
+
+			if summary["cache"] != tc.wantCache {
+				t.Errorf("cache = %v, want %v", summary["cache"], tc.wantCache)
+			}
+			if tc.wantReason == "" {
+				if _, ok := summary["miss_reason"]; ok {
+					t.Errorf("a hit should carry no miss_reason, got %v", summary["miss_reason"])
+				}
+			} else if summary["miss_reason"] != tc.wantReason {
+				t.Errorf("miss_reason = %v, want %v", summary["miss_reason"], tc.wantReason)
+			}
+		})
+	}
+}
+
+func TestSearchReportsCacheBypass(t *testing.T) {
+	ias := &fakeItunes{response: itunes.SearchResponse{ResultCount: 1, Results: []itunes.Result{sampleResult()}}}
+	handler := newTestHandler(ias, &fakeCatalogue{}, &fakeCrawler{})
+
+	summary := annotatedGet(t, handler, "/api/v1/podcasts/?searchTerm=test")
+
+	// Search has no cache to hit: iTunes response caching is out of scope for
+	// this phase, and the log should say so rather than imply a miss.
+	if summary["cache"] != "bypass" {
+		t.Errorf("cache = %v, want bypass", summary["cache"])
 	}
 }

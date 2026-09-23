@@ -28,6 +28,7 @@ func Middleware(logger *slog.Logger) func(http.Handler) http.Handler {
 
 			reqLogger := logger.With(slog.String("request_id", requestID))
 			ctx := WithContext(r.Context(), reqLogger)
+			ctx, annotations := withAnnotations(ctx)
 
 			rw := &responseWriter{ResponseWriter: w, status: http.StatusOK}
 
@@ -53,7 +54,7 @@ func Middleware(logger *slog.Logger) func(http.Handler) http.Handler {
 					level = slog.LevelWarn
 				}
 
-				reqLogger.LogAttrs(ctx, level, "request completed",
+				attrs := []slog.Attr{
 					slog.String("method", r.Method),
 					slog.String("path", r.URL.Path),
 					slog.String("query", r.URL.RawQuery),
@@ -62,7 +63,13 @@ func Middleware(logger *slog.Logger) func(http.Handler) http.Handler {
 					slog.Int("status", rw.status),
 					slog.Int("bytes", rw.bytes),
 					slog.Duration("duration", time.Since(start)),
-				)
+				}
+				// Whatever the handler reported about itself, so the summary
+				// line says where the data came from rather than needing a
+				// second line for it.
+				attrs = append(attrs, annotations.collect()...)
+
+				reqLogger.LogAttrs(ctx, level, "request completed", attrs...)
 			}()
 
 			next.ServeHTTP(rw, r.WithContext(ctx))

@@ -119,6 +119,10 @@ func (h *Handler) getPodcasts(res http.ResponseWriter, req *http.Request) {
 
 	h.rememberPodcasts(ctx, logger, itunesRes.Results)
 
+	// Search always goes upstream: iTunes response caching is deliberately not
+	// part of this phase.
+	logging.AnnotateCache(ctx, logging.CacheBypass, slog.Int("results", len(podcasts)))
+
 	logger.DebugContext(ctx, "itunes search succeeded", slog.Int("results", len(podcasts)))
 
 	utils.WriteJson(res, http.StatusOK, podcasts)
@@ -148,6 +152,8 @@ func (h *Handler) getPodcast(res http.ResponseWriter, req *http.Request) {
 
 	h.rememberPodcasts(ctx, logger, []itunes.Result{*podcast})
 
+	logging.AnnotateCache(ctx, logging.CacheBypass)
+
 	utils.WriteJson(res, http.StatusOK, utils.MapPodcast(podcast))
 }
 
@@ -165,7 +171,7 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	feed, err := h.resolveFeed(ctx, logger, int64(parsedId))
+	feed, fromCatalogue, err := h.resolveFeed(ctx, logger, int64(parsedId))
 
 	if err != nil {
 		if errors.Is(err, errNoFeed) {
@@ -184,7 +190,8 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 
 	// A feed nobody has crawled yet is filled in now, once. After that the
 	// crawler keeps it fresh and this endpoint only reads.
-	if feed.NeverCrawled() {
+	crawled := feed.NeverCrawled()
+	if crawled {
 		if err := h.crawlColdFeed(ctx, logger, *feed); err != nil {
 			logger.ErrorContext(ctx, "fetching rss feed failed",
 				slog.String("feed_url", feed.URL),
@@ -209,7 +216,22 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 		episodes[i] = utils.MapStoredEpisode(&stored[i])
 	}
 
-	logger.DebugContext(ctx, "episodes served from the catalogue", slog.Int("episodes", len(episodes)))
+	// Say plainly whether this request cost an upstream call. A hit is the
+	// whole point of the catalogue; a miss should be rare after the first
+	// request for a podcast.
+	count := slog.Int("episodes", len(episodes))
+	switch {
+	case !fromCatalogue:
+		// The podcast was not known, so iTunes had to be asked.
+		logging.AnnotateCache(ctx, logging.CacheMiss, slog.String("miss_reason", "unknown_podcast"), count)
+	case crawled:
+		// Known podcast, but its feed had never been fetched.
+		logging.AnnotateCache(ctx, logging.CacheMiss, slog.String("miss_reason", "uncrawled_feed"), count)
+	default:
+		logging.AnnotateCache(ctx, logging.CacheHit, count)
+	}
+
+	logger.DebugContext(ctx, "episodes served", slog.Int("episodes", len(episodes)))
 
 	utils.WriteJson(res, http.StatusOK, episodes)
 }
@@ -218,15 +240,16 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 var errNoFeed = errors.New("podcast has no feed url")
 
 // resolveFeed finds a podcast's feed, preferring the catalogue and falling back
-// to iTunes.
+// to iTunes. It reports whether the catalogue could answer without going
+// upstream.
 //
 // Reading the catalogue first is the whole point of phase 1: iTunes allows
 // roughly twenty requests a minute per IP and every user shares this server's.
-func (h *Handler) resolveFeed(ctx context.Context, logger *slog.Logger, itunesID int64) (*store.Feed, error) {
+func (h *Handler) resolveFeed(ctx context.Context, logger *slog.Logger, itunesID int64) (*store.Feed, bool, error) {
 	_, feed, err := h.catalogue.PodcastWithFeedByItunesID(ctx, itunesID)
 	switch {
 	case err == nil && feed != nil:
-		return feed, nil
+		return feed, true, nil
 
 	case err == nil && feed == nil:
 		// Known podcast, no feed. Ask iTunes once more in case it has since
@@ -242,23 +265,23 @@ func (h *Handler) resolveFeed(ctx context.Context, logger *slog.Logger, itunesID
 
 	result, err := h.lookupPodcast(ctx, int(itunesID))
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !isPodcast(result) {
 		// An iTunes ID that belongs to an artist or an album resolves fine but
 		// has no feed. Storing it would put a row keyed on collectionId 0 in
 		// the catalogue, which every other non-podcast would then collide with.
-		return nil, errNoFeed
+		return nil, false, errNoFeed
 	}
 
 	_, upserted, err := h.catalogue.UpsertPodcastWithFeed(ctx, utils.MapPodcastUpsert(result))
 	if err != nil {
-		return nil, fmt.Errorf("storing podcast: %w", err)
+		return nil, false, fmt.Errorf("storing podcast: %w", err)
 	}
 	if upserted == nil {
-		return nil, errNoFeed
+		return nil, false, errNoFeed
 	}
-	return upserted, nil
+	return upserted, false, nil
 }
 
 // isPodcast reports whether an iTunes result is a podcast worth cataloguing.

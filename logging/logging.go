@@ -16,7 +16,10 @@ type ctxKey struct{}
 type Config struct {
 	// Level is one of "debug", "info", "warn" or "error". Defaults to "info".
 	Level string
-	// Format is either "json" or "text". Defaults to "json".
+	// Format is "json", "pretty" or "text". When empty it is "pretty" if the
+	// output is a terminal and "json" otherwise, which gives readable local
+	// logs and parseable production ones without either having to be
+	// configured.
 	Format string
 }
 
@@ -33,9 +36,17 @@ func New(w io.Writer, cfg Config) *slog.Logger {
 	opts := &slog.HandlerOptions{Level: parseLevel(cfg.Level)}
 
 	var handler slog.Handler
-	if strings.EqualFold(cfg.Format, "text") {
+	switch {
+	case strings.EqualFold(cfg.Format, "pretty"):
+		handler = NewPrettyHandler(w, opts)
+	case strings.EqualFold(cfg.Format, "text"):
 		handler = slog.NewTextHandler(w, opts)
-	} else {
+	case strings.EqualFold(cfg.Format, "json"):
+		handler = slog.NewJSONHandler(w, opts)
+	case shouldColor(w):
+		// Unset and attached to a terminal: someone is watching.
+		handler = NewPrettyHandler(w, opts)
+	default:
 		handler = slog.NewJSONHandler(w, opts)
 	}
 

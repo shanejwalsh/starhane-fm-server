@@ -123,7 +123,9 @@ or SSL mode is assumed — it all comes from the connection string.
 | Variable | Values | Default |
 |---|---|---|
 | `LOG_LEVEL` | `debug`, `info`, `warn`, `error` | `info` |
-| `LOG_FORMAT` | `json`, `text` | `json` |
+| `LOG_FORMAT` | `pretty`, `json`, `text` | `pretty` on a terminal, else `json` |
+| `NO_COLOR` | set to any value to disable colour | unset |
+| `FORCE_COLOR` | set to any value to keep colour when piping | unset |
 
 ### Connection pool (both services)
 
@@ -348,8 +350,46 @@ Handlers take the request-scoped logger from the context with
 `logging.FromContext`, never the package-level `slog`, so their lines carry the
 `request_id` that ties them to the request summary.
 
+### Formats
+
+`LOG_FORMAT` picks the handler. Left unset it is `pretty` when output is a
+terminal and `json` otherwise, so local runs are readable and production stays
+parseable without either having to be configured.
+
+- `pretty` — aligned, coloured console output. Development only.
+- `json` — one object per line. What Railway gets.
+- `text` — the stdlib `TextHandler`.
+
+Colour follows the [NO_COLOR](https://no-color.org) convention and is skipped
+when output is not a terminal, so piping to a file stays clean. `FORCE_COLOR`
+overrides that.
+
+```
+18:50:58 INFO  request completed   request_id=e7b4… path=/api/v1/podcasts/1200361736/episodes status=200 duration=217.9ms cache=miss miss_reason=unknown_podcast episodes=62
+18:50:58 INFO  request completed   request_id=c6ba… path=/api/v1/podcasts/1200361736/episodes status=200 duration=3.7ms   cache=hit episodes=62
+18:51:01 INFO  feed crawled        feed_id=2 host=feeds.simplecast.com outcome=changed status=200 episodes=828 duration=209.3ms
+```
+
+`status`, `cache`, `outcome` and `error` are colour-coded so a failing crawl or
+a cache miss stands out while the log scrolls.
+
+### Cache reporting
+
+The request summary says where the response came from, so there is no need to
+correlate several lines to find out whether a request cost an upstream call:
+
+| `cache` | Meaning |
+|---|---|
+| `hit` | Served entirely from Postgres. No iTunes call, no feed fetch. |
+| `miss` | Something had to be fetched first. `miss_reason` says what: `unknown_podcast` (iTunes lookup needed) or `uncrawled_feed` (feed fetched synchronously). |
+| `bypass` | The endpoint always goes upstream. Search does, until iTunes responses are cached. |
+
+Handlers add this with `logging.AnnotateCache`, which attaches attributes to the
+summary line the middleware is already going to write rather than emitting a
+second line. `logging.Annotate` does the same for arbitrary attributes.
+
 ```bash
-LOG_LEVEL=debug LOG_FORMAT=text make run-api
+LOG_LEVEL=debug LOG_FORMAT=pretty make run-api
 ```
 
 ## Testing
