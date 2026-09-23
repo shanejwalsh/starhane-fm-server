@@ -133,3 +133,117 @@ func (s *Store) PodcastWithFeedByItunesID(ctx context.Context, itunesID int64) (
 	}
 	return podcast, &feed, nil
 }
+
+// UpsertPodcasts stores many podcasts and their feeds in one transaction.
+//
+// A search returns up to 50 results, and seeding the catalogue from them one
+// transaction at a time would add real latency to every search. Feeds are
+// written first so the podcasts can reference them.
+func (s *Store) UpsertPodcasts(ctx context.Context, podcasts []PodcastUpsert) error {
+	if len(podcasts) == 0 {
+		return nil
+	}
+
+	tx, err := s.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("beginning transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	feedIDs, err := upsertFeedURLs(ctx, tx, podcasts)
+	if err != nil {
+		return err
+	}
+
+	const upsertPodcast = `
+		INSERT INTO podcasts (
+		    itunes_id, feed_id, title, artist_name,
+		    artwork_url_30, artwork_url_100, artwork_url_600, genres, explicit
+		)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+		ON CONFLICT (itunes_id) DO UPDATE SET
+		    title           = EXCLUDED.title,
+		    artist_name     = EXCLUDED.artist_name,
+		    artwork_url_30  = EXCLUDED.artwork_url_30,
+		    artwork_url_100 = EXCLUDED.artwork_url_100,
+		    artwork_url_600 = EXCLUDED.artwork_url_600,
+		    genres          = EXCLUDED.genres,
+		    explicit        = EXCLUDED.explicit,
+		    feed_id         = COALESCE(EXCLUDED.feed_id, podcasts.feed_id),
+		    updated_at      = now()`
+
+	batch := &pgx.Batch{}
+	for _, p := range podcasts {
+		var feedID *int64
+		if id, ok := feedIDs[p.FeedURL]; ok {
+			feedID = &id
+		}
+		genres := p.Genres
+		if genres == nil {
+			genres = []string{}
+		}
+		batch.Queue(upsertPodcast,
+			p.ItunesID, feedID, p.Title, p.ArtistName,
+			p.ArtworkURL30, p.ArtworkURL100, p.ArtworkURL600, genres, p.Explicit,
+		)
+	}
+
+	results := tx.SendBatch(ctx, batch)
+	for range podcasts {
+		if _, err := results.Exec(); err != nil {
+			results.Close()
+			return fmt.Errorf("upserting podcasts: %w", err)
+		}
+	}
+	if err := results.Close(); err != nil {
+		return fmt.Errorf("upserting podcasts: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("committing podcasts: %w", err)
+	}
+	return nil
+}
+
+// upsertFeedURLs writes every distinct feed URL in podcasts, returning their
+// ids keyed by URL.
+func upsertFeedURLs(ctx context.Context, tx pgx.Tx, podcasts []PodcastUpsert) (map[string]int64, error) {
+	urls := make([]string, 0, len(podcasts))
+	seen := make(map[string]bool, len(podcasts))
+	for _, p := range podcasts {
+		if p.FeedURL == "" || seen[p.FeedURL] {
+			continue
+		}
+		seen[p.FeedURL] = true
+		urls = append(urls, p.FeedURL)
+	}
+	if len(urls) == 0 {
+		return nil, nil
+	}
+
+	const upsertFeed = `
+		INSERT INTO feeds (url)
+		SELECT unnest($1::text[])
+		ON CONFLICT (url) DO UPDATE SET updated_at = now()
+		RETURNING id, url`
+
+	rows, err := tx.Query(ctx, upsertFeed, urls)
+	if err != nil {
+		return nil, fmt.Errorf("upserting feeds: %w", err)
+	}
+	defer rows.Close()
+
+	feedIDs := make(map[string]int64, len(urls))
+	for rows.Next() {
+		var id int64
+		var url string
+		if err := rows.Scan(&id, &url); err != nil {
+			return nil, fmt.Errorf("upserting feeds: %w", err)
+		}
+		feedIDs[url] = id
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("upserting feeds: %w", err)
+	}
+	return feedIDs, nil
+}

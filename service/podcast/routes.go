@@ -1,16 +1,22 @@
 package podcast
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/gorilla/mux"
-	"github.com/shanejwalsh/itunes-xml-parser/feeds"
+	"github.com/jackc/pgx/v5"
 	"github.com/shanejwalsh/itunes-xml-parser/itunes"
+	"golang.org/x/sync/singleflight"
 
+	"github.com/shanejwalsh/starhane-fm-server/crawl"
 	"github.com/shanejwalsh/starhane-fm-server/logging"
+	"github.com/shanejwalsh/starhane-fm-server/store"
 	"github.com/shanejwalsh/starhane-fm-server/types"
 	"github.com/shanejwalsh/starhane-fm-server/utils"
 )
@@ -22,16 +28,58 @@ const (
 	EPISODES_PATH = "/{podcastId}/episodes"
 )
 
-type Handler struct {
-	itunesParserService *itunes.ItunesApiServices
-	feedService         *feeds.RssFeedService
+// ItunesService is the part of the iTunes client the handlers use. It is an
+// interface so handlers can be tested without reaching the network.
+type ItunesService interface {
+	SearchWithContext(ctx context.Context, params itunes.SearchParams) (itunes.SearchResponse, error)
+	FindByIdWithContext(ctx context.Context, id int) (itunes.SearchResponse, error)
 }
 
-func NewHandler(ias *itunes.ItunesApiServices, fs *feeds.RssFeedService) *Handler {
+// Catalogue is the part of the store the handlers use.
+type Catalogue interface {
+	UpsertPodcasts(ctx context.Context, podcasts []store.PodcastUpsert) error
+	UpsertPodcastWithFeed(ctx context.Context, podcast store.PodcastUpsert) (store.Podcast, *store.Feed, error)
+	PodcastWithFeedByItunesID(ctx context.Context, itunesID int64) (store.Podcast, *store.Feed, error)
+	EpisodesByFeed(ctx context.Context, feedID int64) ([]store.Episode, error)
+}
 
+// FeedCrawler crawls a single feed. The API uses it only to fill a feed it has
+// never seen before; everything after that is the crawler service's job.
+type FeedCrawler interface {
+	CrawlFeed(ctx context.Context, feed store.Feed) (crawl.Report, error)
+}
+
+type Handler struct {
+	itunesParserService ItunesService
+	catalogue           Catalogue
+	crawler             FeedCrawler
+
+	searchParams    itunes.SearchParams
+	syncCrawlBudget time.Duration
+
+	// coldCrawls collapses concurrent first-requests for the same feed into a
+	// single crawl. Duplicate crawls across processes are harmless — every
+	// write is an idempotent upsert — so this need not be distributed.
+	coldCrawls singleflight.Group
+}
+
+// Options configures a Handler.
+type Options struct {
+	SearchLimit     int
+	SearchCountry   string
+	SyncCrawlBudget time.Duration
+}
+
+func NewHandler(ias ItunesService, catalogue Catalogue, crawler FeedCrawler, opts Options) *Handler {
 	return &Handler{
 		itunesParserService: ias,
-		feedService:         fs,
+		catalogue:           catalogue,
+		crawler:             crawler,
+		searchParams: itunes.SearchParams{
+			Limit:   opts.SearchLimit,
+			Country: opts.SearchCountry,
+		},
+		syncCrawlBudget: opts.SyncCrawlBudget,
 	}
 }
 
@@ -48,15 +96,17 @@ func (h *Handler) RegisterRoutes(router *mux.Router) {
 
 func (h *Handler) getPodcasts(res http.ResponseWriter, req *http.Request) {
 
+	ctx := req.Context()
 	searchTerm := req.URL.Query().Get("searchTerm")
+	logger := logging.FromContext(ctx).With(slog.String("search_term", searchTerm))
 
-	itunesRes, err := h.itunesParserService.Search(searchTerm)
+	params := h.searchParams
+	params.Term = searchTerm
+
+	itunesRes, err := h.itunesParserService.SearchWithContext(ctx, params)
 
 	if err != nil {
-		logging.FromContext(req.Context()).ErrorContext(req.Context(), "itunes search failed",
-			slog.String("search_term", searchTerm),
-			slog.Any("error", err),
-		)
+		logger.ErrorContext(ctx, "itunes search failed", slog.Any("error", err))
 		utils.WriteJson(res, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -67,10 +117,9 @@ func (h *Handler) getPodcasts(res http.ResponseWriter, req *http.Request) {
 		podcasts[i] = utils.MapPodcast(&podcast)
 	}
 
-	logging.FromContext(req.Context()).DebugContext(req.Context(), "itunes search succeeded",
-		slog.String("search_term", searchTerm),
-		slog.Int("results", len(podcasts)),
-	)
+	h.rememberPodcasts(ctx, logger, itunesRes.Results)
+
+	logger.DebugContext(ctx, "itunes search succeeded", slog.Int("results", len(podcasts)))
 
 	utils.WriteJson(res, http.StatusOK, podcasts)
 }
@@ -89,13 +138,15 @@ func (h *Handler) getPodcast(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	podcast, err := h.lookupPodcast(parsedId)
+	podcast, err := h.lookupPodcast(ctx, parsedId)
 
 	if err != nil {
 		logger.WarnContext(ctx, "podcast lookup failed", slog.Any("error", err))
 		utils.WriteJson(res, http.StatusNotFound, err.Error())
 		return
 	}
+
+	h.rememberPodcasts(ctx, logger, []itunes.Result{*podcast})
 
 	utils.WriteJson(res, http.StatusOK, utils.MapPodcast(podcast))
 }
@@ -114,38 +165,148 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	podcast, err := h.lookupPodcast(parsedId)
+	feed, err := h.resolveFeed(ctx, logger, int64(parsedId))
 
 	if err != nil {
+		if errors.Is(err, errNoFeed) {
+			// A podcast with no feed URL could never be served, which is the
+			// same failure this endpoint has always reported for one.
+			logger.ErrorContext(ctx, "podcast has no feed url", slog.Any("error", err))
+			utils.WriteJson(res, http.StatusInternalServerError, err.Error())
+			return
+		}
 		logger.WarnContext(ctx, "podcast lookup failed", slog.Any("error", err))
 		utils.WriteJson(res, http.StatusNotFound, err.Error())
 		return
 	}
 
-	feedsResp, err := h.feedService.GetFeed(podcast.FeedURL)
+	logger = logger.With(slog.Int64("feed_id", feed.ID))
+
+	// A feed nobody has crawled yet is filled in now, once. After that the
+	// crawler keeps it fresh and this endpoint only reads.
+	if feed.NeverCrawled() {
+		if err := h.crawlColdFeed(ctx, logger, *feed); err != nil {
+			logger.ErrorContext(ctx, "fetching rss feed failed",
+				slog.String("feed_url", feed.URL),
+				slog.Any("error", err),
+			)
+			utils.WriteJson(res, http.StatusInternalServerError, err.Error())
+			return
+		}
+	}
+
+	stored, err := h.catalogue.EpisodesByFeed(ctx, feed.ID)
 
 	if err != nil {
-		logger.ErrorContext(ctx, "fetching rss feed failed",
-			slog.String("feed_url", podcast.FeedURL),
-			slog.Any("error", err),
-		)
+		logger.ErrorContext(ctx, "reading episodes failed", slog.Any("error", err))
 		utils.WriteJson(res, http.StatusInternalServerError, err.Error())
 		return
 	}
 
-	episodes := make([]types.EpisodeResponse, len(feedsResp.Channel.Item))
+	episodes := make([]types.EpisodeResponse, len(stored))
 
-	for i, item := range feedsResp.Channel.Item {
-		episodes[i] = utils.MapToEpisodeResponse(&item)
+	for i := range stored {
+		episodes[i] = utils.MapStoredEpisode(&stored[i])
 	}
 
-	logger.DebugContext(ctx, "rss feed parsed", slog.Int("episodes", len(episodes)))
+	logger.DebugContext(ctx, "episodes served from the catalogue", slog.Int("episodes", len(episodes)))
 
 	utils.WriteJson(res, http.StatusOK, episodes)
 }
 
-func (h *Handler) lookupPodcast(id int) (*itunes.Result, error) {
-	res, err := h.itunesParserService.FindById(id)
+// errNoFeed means the podcast exists but has no feed URL to crawl.
+var errNoFeed = errors.New("podcast has no feed url")
+
+// resolveFeed finds a podcast's feed, preferring the catalogue and falling back
+// to iTunes.
+//
+// Reading the catalogue first is the whole point of phase 1: iTunes allows
+// roughly twenty requests a minute per IP and every user shares this server's.
+func (h *Handler) resolveFeed(ctx context.Context, logger *slog.Logger, itunesID int64) (*store.Feed, error) {
+	_, feed, err := h.catalogue.PodcastWithFeedByItunesID(ctx, itunesID)
+	switch {
+	case err == nil && feed != nil:
+		return feed, nil
+
+	case err == nil && feed == nil:
+		// Known podcast, no feed. Ask iTunes once more in case it has since
+		// published one.
+
+	case errors.Is(err, pgx.ErrNoRows):
+		// Not in the catalogue yet.
+
+	default:
+		logger.WarnContext(ctx, "could not read the catalogue, falling back to itunes",
+			slog.Any("error", err))
+	}
+
+	result, err := h.lookupPodcast(ctx, int(itunesID))
+	if err != nil {
+		return nil, err
+	}
+
+	_, upserted, err := h.catalogue.UpsertPodcastWithFeed(ctx, utils.MapPodcastUpsert(result))
+	if err != nil {
+		return nil, fmt.Errorf("storing podcast: %w", err)
+	}
+	if upserted == nil {
+		return nil, errNoFeed
+	}
+	return upserted, nil
+}
+
+// crawlColdFeed crawls a feed the catalogue has never filled, so the first
+// request for a podcast still returns its episodes.
+func (h *Handler) crawlColdFeed(ctx context.Context, logger *slog.Logger, feed store.Feed) error {
+	budget, cancel := context.WithTimeout(ctx, h.syncCrawlBudget)
+	defer cancel()
+
+	key := strconv.FormatInt(feed.ID, 10)
+	_, err, shared := h.coldCrawls.Do(key, func() (any, error) {
+		logger.InfoContext(budget, "crawling a feed for the first time", slog.String("feed_url", feed.URL))
+		report, err := h.crawler.CrawlFeed(budget, feed)
+		if err != nil {
+			return nil, err
+		}
+		if report.Err != nil {
+			return nil, report.Err
+		}
+		return nil, nil
+	})
+
+	if shared {
+		logger.DebugContext(ctx, "joined an in-flight first crawl")
+	}
+	return err
+}
+
+// rememberPodcasts stores what iTunes just told us and schedules the feeds for
+// crawling. This is the lazy catalogue: browsing the API is what fills it.
+//
+// A failure here is logged but never fails the request — the caller got their
+// answer from iTunes regardless.
+func (h *Handler) rememberPodcasts(ctx context.Context, logger *slog.Logger, results []itunes.Result) {
+	if len(results) == 0 {
+		return
+	}
+
+	upserts := make([]store.PodcastUpsert, 0, len(results))
+	for i := range results {
+		upserts = append(upserts, utils.MapPodcastUpsert(&results[i]))
+	}
+
+	if err := h.catalogue.UpsertPodcasts(ctx, upserts); err != nil {
+		logger.WarnContext(ctx, "could not store podcasts in the catalogue",
+			slog.Int("podcasts", len(upserts)),
+			slog.Any("error", err),
+		)
+		return
+	}
+	logger.DebugContext(ctx, "catalogue updated", slog.Int("podcasts", len(upserts)))
+}
+
+func (h *Handler) lookupPodcast(ctx context.Context, id int) (*itunes.Result, error) {
+	res, err := h.itunesParserService.FindByIdWithContext(ctx, id)
 	if err != nil {
 		return nil, err
 	}
