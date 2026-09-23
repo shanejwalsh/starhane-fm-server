@@ -44,6 +44,25 @@ func newCrawler(t *testing.T) (*crawl.Crawler, *store.Store, context.Context) {
 	return crawl.NewCrawler(s, testCrawlerConfig(), logger), s, ctx
 }
 
+// requestedFeed upserts a feed and activates it, which is what a request for
+// its episodes does. Seeded feeds are dormant and never crawled.
+func requestedFeed(t *testing.T, s *store.Store, ctx context.Context, url string) store.Feed {
+	t.Helper()
+
+	feed, err := s.UpsertFeed(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkFeedRequested(ctx, feed.ID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	activated, err := s.FeedByID(ctx, feed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return activated
+}
+
 func feedDocument(channelExtra string, items ...string) string {
 	body := ""
 	for _, item := range items {
@@ -395,14 +414,15 @@ func TestCrawlFeedMarksGoneFeedDead(t *testing.T) {
 		t.Error("a dead feed should be rechecked much later, not soon")
 	}
 
-	// Dead feeds drop out of the crawl queue.
+	// A dead feed leaves the queue until its recheck comes due — it is not
+	// written off permanently.
 	claimed, err := s.ClaimDueFeeds(ctx, 10, time.Minute)
 	if err != nil {
 		t.Fatal(err)
 	}
 	for _, f := range claimed {
 		if f.ID == feed.ID {
-			t.Error("a dead feed was claimed for crawling")
+			t.Error("a dead feed was claimed before its recheck was due")
 		}
 	}
 }
@@ -508,5 +528,197 @@ func TestCrawlFeedMalformedXMLIsAFailure(t *testing.T) {
 	}
 	if !after.NeverCrawled() {
 		t.Error("a feed that never parsed should still report NeverCrawled")
+	}
+}
+
+func TestCrawlFeedActivatesADormantFeedEvenWhenTheCrawlFails(t *testing.T) {
+	c, s, ctx := newCrawler(t)
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	// A dormant feed reaches the crawler only through the API's first-request
+	// path, which has already activated it in the database. The struct handed
+	// over still says dormant, and writing that back would undo the activation
+	// and leave the feed asleep forever.
+	feed, err := s.UpsertFeed(ctx, srv.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if feed.Status != store.StatusDormant {
+		t.Fatalf("a seeded feed should start dormant, got %q", feed.Status)
+	}
+
+	if _, err := c.CrawlFeed(ctx, feed); err != nil {
+		t.Fatal(err)
+	}
+
+	after, err := s.FeedByID(ctx, feed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Status != store.StatusActive {
+		t.Errorf("status = %q, want %q so the crawler keeps retrying it", after.Status, store.StatusActive)
+	}
+}
+
+func TestCrawlFeedPrunesEpisodesThatVanish(t *testing.T) {
+	pool := testdb.Setup(t)
+	s := store.New(pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const grace = 2
+	cfg := testCrawlerConfig()
+	cfg.EpisodeGraceCrawls = grace
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := crawl.NewCrawler(s, cfg, logger)
+
+	var pass atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := pass.Add(1)
+		if n == 1 {
+			_, _ = io.WriteString(w, feedDocument("", episodeItem("ep1", "One"), episodeItem("ep2", "Two")))
+			return
+		}
+		// ep2 is gone from here on. The title changes so the body hash differs
+		// and every crawl really re-parses.
+		_, _ = io.WriteString(w, feedDocument("", episodeItem("ep1", fmt.Sprintf("One v%d", n))))
+	}))
+	defer srv.Close()
+
+	feed := requestedFeed(t, s, ctx, srv.URL)
+
+	crawlOnce := func() crawl.Report {
+		t.Helper()
+		current, err := s.FeedByID(ctx, feed.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		report, err := c.CrawlFeed(ctx, current)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return report
+	}
+
+	crawlOnce()
+	if n, _ := s.CountEpisodes(ctx, feed.ID); n != 2 {
+		t.Fatalf("after the first crawl there are %d episode rows, want 2", n)
+	}
+
+	// Within the grace window the row survives, so one bad document cannot
+	// erase a feed's history.
+	for i := range grace {
+		report := crawlOnce()
+		if report.Pruned != 0 {
+			t.Errorf("crawl %d pruned %d rows inside the grace window", i+1, report.Pruned)
+		}
+		if n, _ := s.CountEpisodes(ctx, feed.ID); n != 2 {
+			t.Errorf("after crawl %d there are %d rows, want the vanished episode kept", i+1, n)
+		}
+	}
+
+	// Past the window it goes.
+	report := crawlOnce()
+	if report.Pruned != 1 {
+		t.Errorf("pruned %d rows, want 1", report.Pruned)
+	}
+	if n, _ := s.CountEpisodes(ctx, feed.ID); n != 1 {
+		t.Errorf("%d episode rows remain, want 1", n)
+	}
+
+	remaining, err := s.EpisodesByFeed(ctx, feed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != 1 || remaining[0].Guid != "ep1" {
+		t.Errorf("served %+v, want just ep1", remaining)
+	}
+}
+
+func TestCrawlFeedDoesNotPruneWhenAFeedGoesEmpty(t *testing.T) {
+	pool := testdb.Setup(t)
+	s := store.New(pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cfg := testCrawlerConfig()
+	cfg.EpisodeGraceCrawls = 1
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := crawl.NewCrawler(s, cfg, logger)
+
+	var pass atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if pass.Add(1) == 1 {
+			_, _ = io.WriteString(w, feedDocument("", episodeItem("ep1", "One")))
+			return
+		}
+		// A valid document with no items at all — far more likely a broken
+		// origin than a podcast that deleted its entire back catalogue.
+		_, _ = io.WriteString(w, feedDocument("<generator>glitch</generator>"))
+	}))
+	defer srv.Close()
+
+	feed := requestedFeed(t, s, ctx, srv.URL)
+
+	for range 4 {
+		current, err := s.FeedByID(ctx, feed.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.CrawlFeed(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if n, _ := s.CountEpisodes(ctx, feed.ID); n != 1 {
+		t.Errorf("%d episode rows, want the history kept when the feed went empty", n)
+	}
+}
+
+func TestPruningDisabledByZeroGrace(t *testing.T) {
+	pool := testdb.Setup(t)
+	s := store.New(pool)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	cfg := testCrawlerConfig()
+	cfg.EpisodeGraceCrawls = 0
+
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	c := crawl.NewCrawler(s, cfg, logger)
+
+	var pass atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := pass.Add(1)
+		if n == 1 {
+			_, _ = io.WriteString(w, feedDocument("", episodeItem("ep1", "One"), episodeItem("ep2", "Two")))
+			return
+		}
+		_, _ = io.WriteString(w, feedDocument("", episodeItem("ep1", fmt.Sprintf("One v%d", n))))
+	}))
+	defer srv.Close()
+
+	feed := requestedFeed(t, s, ctx, srv.URL)
+	for range 5 {
+		current, err := s.FeedByID(ctx, feed.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := c.CrawlFeed(ctx, current); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if n, _ := s.CountEpisodes(ctx, feed.ID); n != 2 {
+		t.Errorf("%d episode rows, want both kept with pruning disabled", n)
 	}
 }

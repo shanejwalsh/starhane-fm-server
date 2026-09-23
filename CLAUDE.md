@@ -33,10 +33,11 @@ Three binaries over one Postgres database:
   the API and crawler would race.
 
 The API is no longer stateless. Every podcast it returns from an iTunes search
-or lookup is upserted into Postgres with its feed URL, and that feed becomes due
-for crawling. `GET /api/v1/podcasts/{id}/episodes` reads from the database;
-only a feed that has never been crawled is fetched synchronously, once, via the
-same `crawl.Crawler` the crawler service uses.
+or lookup is upserted into Postgres with its feed URL, but the feed starts
+**dormant** and is not crawled. Requesting a podcast's episodes activates its
+feed — that is the only thing that does. `GET /api/v1/podcasts/{id}/episodes`
+reads from the database; only a feed that has never been crawled is fetched
+synchronously, once, via the same `crawl.Crawler` the crawler service uses.
 
 Package map:
 
@@ -94,6 +95,15 @@ hashing possible, so do not reintroduce `feeds.GetFeed` in the crawl path.
   row survives.
 - Claiming feeds leases `next_check_at` forward, so a crashed worker's feeds
   return to the queue.
+- `feeds.status` is the lifecycle: `dormant` (seeded, never requested) →
+  `active` (requested) → `dead` (retried on `CRAWLER_DEAD_RECHECK`), plus
+  `redirected` stubs. Only `active` and `dead` are ever claimed. Do not make
+  `UpsertFeed` create active feeds — that is what bounds catalogue growth.
+- `crawl.Crawler.apply` promotes a dormant feed to active before writing,
+  because the API activates a feed and then hands the crawler the struct it read
+  beforehand; writing that back would undo the activation.
+- Episodes absent for `CRAWLER_EPISODE_GRACE_CRAWLS` crawls are deleted, but
+  never when a parse produced zero episodes.
 - Permanent redirects are deliberately **not** followed by the HTTP client; the
   new URL is recorded instead.
 

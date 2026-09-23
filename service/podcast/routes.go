@@ -41,6 +41,7 @@ type Catalogue interface {
 	UpsertPodcastWithFeed(ctx context.Context, podcast store.PodcastUpsert) (store.Podcast, *store.Feed, error)
 	PodcastWithFeedByItunesID(ctx context.Context, itunesID int64) (store.Podcast, *store.Feed, error)
 	EpisodesByFeed(ctx context.Context, feedID int64) ([]store.Episode, error)
+	MarkFeedRequested(ctx context.Context, feedID int64, throttle time.Duration) (bool, error)
 }
 
 // FeedCrawler crawls a single feed. The API uses it only to fill a feed it has
@@ -54,8 +55,9 @@ type Handler struct {
 	catalogue           Catalogue
 	crawler             FeedCrawler
 
-	searchParams    itunes.SearchParams
-	syncCrawlBudget time.Duration
+	searchParams        itunes.SearchParams
+	syncCrawlBudget     time.Duration
+	feedRequestThrottle time.Duration
 
 	// coldCrawls collapses concurrent first-requests for the same feed into a
 	// single crawl. Duplicate crawls across processes are harmless — every
@@ -65,9 +67,10 @@ type Handler struct {
 
 // Options configures a Handler.
 type Options struct {
-	SearchLimit     int
-	SearchCountry   string
-	SyncCrawlBudget time.Duration
+	SearchLimit         int
+	SearchCountry       string
+	SyncCrawlBudget     time.Duration
+	FeedRequestThrottle time.Duration
 }
 
 func NewHandler(ias ItunesService, catalogue Catalogue, crawler FeedCrawler, opts Options) *Handler {
@@ -79,7 +82,8 @@ func NewHandler(ias ItunesService, catalogue Catalogue, crawler FeedCrawler, opt
 			Limit:   opts.SearchLimit,
 			Country: opts.SearchCountry,
 		},
-		syncCrawlBudget: opts.SyncCrawlBudget,
+		syncCrawlBudget:     opts.SyncCrawlBudget,
+		feedRequestThrottle: opts.FeedRequestThrottle,
 	}
 }
 
@@ -188,6 +192,12 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 
 	logger = logger.With(slog.Int64("feed_id", feed.ID))
 
+	// Asking for a podcast's episodes is what puts its feed into the crawl
+	// rotation. Appearing in a search result does not: a search returns fifty
+	// podcasts and a user opens at most one, so crawling all fifty would make
+	// storage and bandwidth track impressions rather than reading.
+	h.activateFeed(ctx, logger, feed)
+
 	// A feed nobody has crawled yet is filled in now, once. After that the
 	// crawler keeps it fresh and this endpoint only reads.
 	crawled := feed.NeverCrawled()
@@ -234,6 +244,22 @@ func (h *Handler) getEpisodes(res http.ResponseWriter, req *http.Request) {
 	logger.DebugContext(ctx, "episodes served", slog.Int("episodes", len(episodes)))
 
 	utils.WriteJson(res, http.StatusOK, episodes)
+}
+
+// activateFeed records that this feed was asked for, waking it if it was
+// dormant.
+//
+// Best effort: the caller gets their episodes either way, and a feed that fails
+// to activate will simply be activated by the next request.
+func (h *Handler) activateFeed(ctx context.Context, logger *slog.Logger, feed *store.Feed) {
+	activated, err := h.catalogue.MarkFeedRequested(ctx, feed.ID, h.feedRequestThrottle)
+	if err != nil {
+		logger.WarnContext(ctx, "could not record the feed request", slog.Any("error", err))
+		return
+	}
+	if activated && feed.Dormant() {
+		logger.InfoContext(ctx, "feed activated by a request", slog.String("feed_url", feed.URL))
+	}
 }
 
 // errNoFeed means the podcast exists but has no feed URL to crawl.
