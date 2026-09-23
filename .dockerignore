@@ -1,0 +1,9 @@
+.git
+.github
+.claude
+bin
+go.work
+go.work.sum
+.env
+*.md
+!README.md

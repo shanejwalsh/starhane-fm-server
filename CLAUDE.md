@@ -5,65 +5,109 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 ## Commands
 
 ```bash
-make dev                              # go run cmd/main.go  (listens on :8000)
-make build                            # go build -o starhane-fm-server cmd/main.go
-go test ./...                         # all tests
-go test ./logging -run TestParseLevel # a single test
-go vet ./...
-LOG_LEVEL=debug LOG_FORMAT=text make dev
+make run-api                          # go run ./cmd/api  (listens on :8000)
+make run-crawler                      # go run ./cmd/crawler
+make build                            # all three binaries into bin/
+make check                            # gofmt, go vet, go test ./...
+go test ./crawl -run TestParsePubDate # a single test
+make db-start && make db-create       # local Postgres 18
+make migrate-up                       # apply migrations
+LOG_LEVEL=debug LOG_FORMAT=text make run-api
 ```
 
-Docker: `docker build -t starhane-fm-server . && docker run -p 8000:8000 starhane-fm-server`.
+`make` loads `.env` (`-include .env` / `export`). There is no dotenv library in
+the Go code, so production reads real env vars. `bin/`, `.env` and `go.work` are
+git-ignored; `.dockerignore` keeps `go.work` out of the build context.
 
-Note `make build` writes `./starhane-fm-server` at the repo root, and that path is
-*not* covered by `.gitignore` (which ignores `bin`, `main`, `.env`) — don't commit it.
+Integration tests need `TEST_DATABASE_URL` and skip with a message without it.
+Each test binary drops and migrates **its own Postgres schema** (see
+`internal/testdb`), because `go test ./...` runs packages in parallel.
 
 ## Architecture
 
-A stateless HTTP API — no database, no cache. Every request fans out to the iTunes
-Search API and/or a podcast's RSS feed, maps the upstream shape to a local response
-type, and returns it.
+Three binaries over one Postgres database:
 
-All upstream I/O lives in an **external** module,
-[`github.com/shanejwalsh/itunes-xml-parser`](https://github.com/shanejwalsh/itunes-xml-parser)
-(pinned in `go.mod`), split into `itunes` (Search API) and `feeds` (RSS parsing).
-Nothing in this repo talks to iTunes directly, so changing how search or feed parsing
-behaves usually means bumping that dependency's version, not editing code here.
+- `cmd/api` — the HTTP API.
+- `cmd/crawler` — refreshes feeds in the background.
+- `cmd/migrate` — applies embedded migrations. **Never migrate at startup**;
+  the API and crawler would race.
 
-Request flow:
+The API is no longer stateless. Every podcast it returns from an iTunes search
+or lookup is upserted into Postgres with its feed URL, and that feed becomes due
+for crawling. `GET /api/v1/podcasts/{id}/episodes` reads from the database;
+only a feed that has never been crawled is fetched synchronously, once, via the
+same `crawl.Crawler` the crawler service uses.
 
-- `cmd/main.go` builds the logger from env, then `cmd/api/api.go` wires everything:
-  a `mux` router under `/api/v1`, wide-open CORS, and the podcast handler constructed
-  with concrete `*itunes.ItunesApiServices` / `*feeds.RssFeedService` values (no
-  interfaces, so handlers aren't unit-testable without a real network — the only
-  tests today are in `logging/`).
-- `logging.Middleware` wraps the **entire** stack including CORS and the router
-  (deliberately, not `router.Use`) so unmatched routes and preflights are logged too.
-- `service/podcast/routes.go` holds all three handlers. Route paths are declared as
-  consts at the top of the file; add new routes there.
-- `utils/mappers.go` is the boundary: upstream `itunes.Result` / `feeds.Episode`
-  never escape into responses. Keep it that way — `types/` is the public API shape.
+Package map:
 
-Two handler conventions to follow:
+- `config` — all env parsing, one place. Add new settings here, not `os.Getenv`
+  at the point of use.
+- `db` — pgxpool construction plus the embedded migrations and their runner.
+- `store` — every SQL query. Hand-written pgx with `db` struct tags and
+  `RowToStructByNameLax`; no sqlc. A column with no matching struct field is an
+  error, so column lists and structs move together.
+- `crawl` — `fetch.go` (conditional GET, size cap, redirects, 429),
+  `parse.go` (feed → episodes, guid fallback), `schedule.go` (interval maths,
+  pure functions), `crawler.go` (`CrawlFeed`, the shared unit of work),
+  `worker.go` (claim loop and pool).
+- `server` — router, CORS, middleware, graceful shutdown.
+- `service/podcast` — handlers, behind interfaces (`ItunesService`,
+  `Catalogue`, `FeedCrawler`) so they are testable without a network.
+- `utils/mappers.go` — the boundary. Upstream `itunes.Result` and stored
+  `store.Episode` never escape into responses; `types/` is the public API shape.
+
+Upstream I/O lives in
+[`github.com/shanejwalsh/itunes-xml-parser`](https://github.com/shanejwalsh/itunes-xml-parser).
+The crawler owns its own HTTP requests and calls that library's `feeds.Parse` on
+bodies it already has — that separation is what makes conditional GET and body
+hashing possible, so do not reintroduce `feeds.GetFeed` in the crawl path.
+
+## Conventions
 
 1. **Never use the package-level `slog` in a handler.** Get the request-scoped
-   logger with `logging.FromContext(ctx)` — it carries the `request_id` that ties
-   handler logs to the request-completed summary line.
-2. Log level maps to response class: 4xx → `Warn`, 5xx → `Error`, success detail →
-   `Debug`.
+   logger with `logging.FromContext(ctx)` — it carries the `request_id` that
+   ties handler logs to the request-completed summary line.
+2. Log level maps to response class: 4xx → `Warn`, 5xx → `Error`, success detail
+   → `Debug`.
+3. `logging.Middleware` wraps the **entire** stack including CORS and the router
+   (deliberately, not `router.Use`) so unmatched routes and preflights are
+   logged too.
+4. Route paths are consts at the top of `service/podcast/routes.go`.
+5. Pass `context.Context` to every query and every outbound request.
+6. Existing error paths write a bare JSON string
+   (`utils.WriteJson(res, status, err.Error())`). That leaks upstream error text
+   and `utils.WriteError` wraps errors as `{"error": ...}` instead — prefer it
+   for new endpoints, but do not retrofit the three existing ones without
+   deciding to change the public contract.
+7. Never download, proxy or re-host audio. Only enclosure URLs are stored.
 
-Handlers currently write errors as a bare JSON string (`utils.WriteJson(res, status,
-err.Error())`), which leaks upstream error text to clients. `utils.WriteError` wraps
-errors as `{"error": ...}` but is unused; prefer it for new handlers. `types.Episode`
-is likewise dead code — `types.EpisodeResponse` is the live episode shape.
+## Things that exist for a reason
 
-The port is hardcoded to `8000` in `cmd/main.go`; there is no `PORT` env var.
+- `episodes.pub_date_raw` — the API has always returned the feed's own
+  unparsed date string. `pub_date` is the parsed value, used only for cadence.
+- `episodes.position` — the episode list is in feed order, not date order.
+- `episodes.last_crawl_seq` vs `feeds.crawl_seq` — `EpisodesByFeed` serves only
+  the episodes the latest crawl saw, so a removed episode disappears while its
+  row survives.
+- Claiming feeds leases `next_check_at` forward, so a crashed worker's feeds
+  return to the queue.
+- Permanent redirects are deliberately **not** followed by the HTTP client; the
+  new URL is recorded instead.
 
 ## Endpoints
 
-`GET /api/v1/podcasts?searchTerm=…`, `GET /api/v1/podcasts/{podcastId}`, and
-`GET /api/v1/podcasts/{podcastId}/episodes`. The episodes route does two upstream
-calls: an iTunes lookup to resolve `FeedURL`, then a fetch/parse of that feed.
-Lookups go through `Handler.lookupPodcast`, which treats `ResultCount != 1` as a
-404. See `README.md` for full request/response payloads — keep it in sync when
-endpoints or response types change.
+`GET /api/v1/podcasts?searchTerm=…` (301s to the trailing-slash form),
+`GET /api/v1/podcasts/{podcastId}`, and
+`GET /api/v1/podcasts/{podcastId}/episodes`. Lookups go through
+`Handler.lookupPodcast`, which treats `ResultCount != 1` as a 404. See
+`README.md` for full request/response payloads — keep it in sync when endpoints
+or response types change.
+
+## Deployment
+
+Railway, from the multi-stage `Dockerfile` that builds all three binaries into
+one distroless image. Each service picks its binary via its start command;
+`migrate up` runs as the API's pre-deploy command. The crawler service must have
+app sleeping **disabled** — it has no inbound HTTP and would otherwise be
+stopped whenever idle. Pool sizes are set so both services stay under the
+database's `max_connections`, which is logged at startup.
