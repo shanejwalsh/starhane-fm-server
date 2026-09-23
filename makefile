@@ -43,8 +43,12 @@ check: fmt vet test
 
 # --- local database ----------------------------------------------------------
 
+# Postgres normally starts at login via the LaunchAgent
+# (~/Library/LaunchAgents/homebrew.mxcl.postgresql@18.plist). These targets are
+# for starting it by hand. LC_ALL is set because Postgres 18 aborts startup in
+# an environment with no locale.
 db-start:
-	@$(PG_BIN)/pg_ctl -D $(PGDATA) -l $(PGLOG) -o "-p 5432" start || true
+	@LC_ALL=en_US.UTF-8 $(PG_BIN)/pg_ctl -D $(PGDATA) -l $(PGLOG) -o "-p 5432" start || true
 	@$(PG_BIN)/pg_isready -p 5432
 
 db-stop:

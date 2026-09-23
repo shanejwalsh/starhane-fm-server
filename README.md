@@ -34,17 +34,27 @@ Production runs PostgreSQL 18, so development should too.
 
 ```bash
 brew install postgresql@18
-make db-start          # pg_ctl, because `brew services` is unreliable here
-make db-create         # creates starhane_fm and starhane_fm_test
+brew link postgresql@18   # make it the default psql/pg_ctl on your PATH
+make db-create            # creates starhane_fm and starhane_fm_test
 ```
 
-`make db-start` uses `PG_BIN` (default `/opt/homebrew/opt/postgresql@18/bin`).
-Homebrew keeps `postgresql@18` keg-only, so if you also have an older Postgres
-installed, `psql` on your `PATH` is probably still the old one — the makefile
-always uses the full path. Override `PG_BIN` and `PGDATA` if your layout differs.
+Postgres normally starts at login. `brew services` is unreliable on macOS here,
+so the service is a LaunchAgent at
+`~/Library/LaunchAgents/homebrew.mxcl.postgresql@18.plist`. It must set
+`LC_ALL`, because launchd starts processes with no locale and Postgres 18
+aborts startup without one:
 
-If you have another Postgres already listening on 5432, stop it first or point
-`DATABASE_URL` at a different port.
+```xml
+<key>EnvironmentVariables</key>
+<dict><key>LC_ALL</key><string>en_US.UTF-8</string></dict>
+```
+
+`make db-start` / `db-stop` / `db-status` drive it by hand when needed. They use
+`PG_BIN` (default `/opt/homebrew/opt/postgresql@18/bin`) and `PGDATA` — override
+those if your layout differs.
+
+If something else is already listening on 5432, stop it or point `DATABASE_URL`
+at another port.
 
 ### 2. Configuration
 
