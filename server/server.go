@@ -62,9 +62,10 @@ func (s *APIServer) Start(ctx context.Context) error {
 	crawler := crawl.NewCrawler(s.store, s.cfg.Crawler, s.logger)
 
 	podcastHandler := podcast.NewHandler(ias, s.store, crawler, podcast.Options{
-		SearchLimit:     s.cfg.Itunes.SearchLimit,
-		SearchCountry:   s.cfg.Itunes.Country,
-		SyncCrawlBudget: s.cfg.Crawler.SyncCrawlBudget,
+		SearchLimit:         s.cfg.Itunes.SearchLimit,
+		SearchCountry:       s.cfg.Itunes.Country,
+		SyncCrawlBudget:     s.cfg.Crawler.SyncCrawlBudget,
+		FeedRequestThrottle: s.cfg.Crawler.FeedRequestThrottle,
 	})
 
 	podcastHandler.RegisterRoutes(subrouter)

@@ -22,10 +22,11 @@ const cadenceSample = 6
 
 // Crawler crawls feeds and records what it found.
 type Crawler struct {
-	store    *store.Store
-	fetcher  *Fetcher
-	schedule Schedule
-	logger   *slog.Logger
+	store      *store.Store
+	fetcher    *Fetcher
+	schedule   Schedule
+	pruneGrace int
+	logger     *slog.Logger
 }
 
 // NewCrawler builds a Crawler from configuration.
@@ -45,7 +46,8 @@ func NewCrawler(s *store.Store, cfg config.Crawler, logger *slog.Logger) *Crawle
 			DeadRecheck: cfg.DeadRecheck,
 			MaxFailures: cfg.MaxFailures,
 		},
-		logger: logger,
+		pruneGrace: cfg.EpisodeGraceCrawls,
+		logger:     logger,
 	}
 }
 
@@ -57,6 +59,7 @@ type Report struct {
 	Outcome   Outcome
 	Status    int
 	Episodes  int
+	Pruned    int
 	Duration  time.Duration
 	Err       error
 	MovedTo   string
@@ -84,11 +87,12 @@ func (c *Crawler) CrawlFeed(ctx context.Context, feed store.Feed) (Report, error
 	report.Status = fetched.StatusCode
 	report.NextCheck = result.Feed.NextCheckAt
 
-	upserted, err := c.store.ApplyCrawl(ctx, result)
+	counts, err := c.store.ApplyCrawl(ctx, result)
 	if err != nil {
 		return report, err
 	}
-	report.Episodes = upserted
+	report.Episodes = counts.Upserted
+	report.Pruned = counts.Pruned
 	report.Duration = time.Since(start)
 
 	c.log(ctx, logger, report)
@@ -101,6 +105,15 @@ func (c *Crawler) apply(ctx context.Context, feed store.Feed, fetched FetchResul
 	next := feed
 	next.LastStatusCode = fetched.StatusCode
 	report := Report{}
+
+	// Crawling a feed at all means it belongs in the rotation. A dormant feed
+	// only reaches here through the API's first-request path, which activates
+	// it just beforehand — but the struct we were handed predates that. Without
+	// this, a first crawl that failed or was rate limited would write the
+	// dormant status back and put the feed to sleep again.
+	if next.Status == store.StatusDormant {
+		next.Status = store.StatusActive
+	}
 
 	switch fetched.Outcome {
 	case OutcomeChanged:
@@ -127,7 +140,12 @@ func (c *Crawler) apply(ctx context.Context, feed store.Feed, fetched FetchResul
 		next.CheckInterval = c.schedule.IntervalAfterChange(c.recentDates(ctx, feed.ID, parsed.Episodes))
 		next.NextCheckAt = c.schedule.NextCheck(now, next.CheckInterval)
 
-		return store.CrawlResult{Feed: next, Parsed: true, Episodes: parsed.Episodes}, report
+		return store.CrawlResult{
+			Feed:       next,
+			Parsed:     true,
+			Episodes:   parsed.Episodes,
+			PruneGrace: c.pruneGrace,
+		}, report
 
 	case OutcomeNotModified:
 		next.ETag = fetched.ETag
@@ -268,6 +286,9 @@ func (c *Crawler) log(ctx context.Context, logger *slog.Logger, report Report) {
 		slog.Int("episodes", report.Episodes),
 		slog.Duration("duration", report.Duration),
 		slog.Time("next_check_at", report.NextCheck),
+	}
+	if report.Pruned > 0 {
+		attrs = append(attrs, slog.Int("episodes_pruned", report.Pruned))
 	}
 	if report.MovedTo != "" {
 		attrs = append(attrs, slog.String("moved_to", report.MovedTo))

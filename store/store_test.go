@@ -39,16 +39,19 @@ func TestUpsertFeedIsIdempotent(t *testing.T) {
 	if first.ID != second.ID {
 		t.Errorf("upserting the same URL made two feeds: %d and %d", first.ID, second.ID)
 	}
-	if first.Status != store.StatusActive {
-		t.Errorf("status = %q, want %q", first.Status, store.StatusActive)
+	// A seeded feed starts dormant: a search seeds fifty of them and a user
+	// opens at most one, so none are crawled until asked for.
+	if first.Status != store.StatusDormant {
+		t.Errorf("status = %q, want %q", first.Status, store.StatusDormant)
+	}
+	if !first.Dormant() {
+		t.Error("a new feed should report Dormant")
 	}
 	if !first.NeverCrawled() {
 		t.Error("a new feed should report NeverCrawled")
 	}
-	// A new feed must be due immediately, otherwise the lazy catalogue never
-	// gets crawled.
-	if first.NextCheckAt.After(time.Now()) {
-		t.Errorf("next_check_at = %s, want a time already passed", first.NextCheckAt)
+	if first.ActivatedAt != nil {
+		t.Errorf("activated_at = %v, want nil until requested", first.ActivatedAt)
 	}
 }
 
@@ -143,14 +146,8 @@ func TestPodcastByItunesIDReportsMissing(t *testing.T) {
 func TestClaimDueFeedsLeasesAndSkipsNotDue(t *testing.T) {
 	s, ctx := newStore(t)
 
-	due, err := s.UpsertFeed(ctx, "https://example.com/due.xml")
-	if err != nil {
-		t.Fatal(err)
-	}
-	notDue, err := s.UpsertFeed(ctx, "https://example.com/later.xml")
-	if err != nil {
-		t.Fatal(err)
-	}
+	due := activeFeed(t, s, ctx, "https://example.com/due.xml")
+	notDue := activeFeed(t, s, ctx, "https://example.com/later.xml")
 	// Push the second feed into the future.
 	notDue.NextCheckAt = time.Now().Add(time.Hour)
 	if _, err := s.ApplyCrawl(ctx, store.CrawlResult{Feed: notDue}); err != nil {
@@ -183,9 +180,7 @@ func TestClaimDueFeedsSkipsLockedRows(t *testing.T) {
 
 	const feedCount = 6
 	for i := range feedCount {
-		if _, err := s.UpsertFeed(ctx, fmt.Sprintf("https://example.com/%d.xml", i)); err != nil {
-			t.Fatal(err)
-		}
+		activeFeed(t, s, ctx, fmt.Sprintf("https://example.com/%d.xml", i))
 	}
 
 	// Two concurrent claimers must between them see each feed exactly once:
@@ -227,5 +222,170 @@ func TestClaimDueFeedsSkipsLockedRows(t *testing.T) {
 			t.Errorf("feed %d was claimed twice", id)
 		}
 		seen[id] = true
+	}
+}
+
+// activeFeed upserts a feed and puts it into the crawl rotation, which is what
+// a request for its episodes would do.
+func activeFeed(t *testing.T, s *store.Store, ctx context.Context, url string) store.Feed {
+	t.Helper()
+
+	feed, err := s.UpsertFeed(ctx, url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.MarkFeedRequested(ctx, feed.ID, time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	activated, err := s.FeedByID(ctx, feed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return activated
+}
+
+func TestDormantFeedsAreNotCrawled(t *testing.T) {
+	s, ctx := newStore(t)
+
+	// This is the change that bounds growth: a search seeds fifty feeds and
+	// none of them cost anything until somebody opens one.
+	for i := range 5 {
+		if _, err := s.UpsertFeed(ctx, fmt.Sprintf("https://example.com/seeded-%d.xml", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	claimed, err := s.ClaimDueFeeds(ctx, 50, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 0 {
+		t.Fatalf("claimed %d seeded feeds, want none until they are requested", len(claimed))
+	}
+}
+
+func TestMarkFeedRequestedActivatesADormantFeed(t *testing.T) {
+	s, ctx := newStore(t)
+
+	feed, err := s.UpsertFeed(ctx, "https://example.com/feed.xml")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	activated, err := s.MarkFeedRequested(ctx, feed.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !activated {
+		t.Error("requesting a dormant feed should activate it")
+	}
+
+	woken, err := s.FeedByID(ctx, feed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if woken.Status != store.StatusActive {
+		t.Errorf("status = %q, want %q", woken.Status, store.StatusActive)
+	}
+	if woken.ActivatedAt == nil || woken.LastRequestedAt == nil {
+		t.Errorf("activated_at = %v, last_requested_at = %v, want both set", woken.ActivatedAt, woken.LastRequestedAt)
+	}
+
+	// It is now claimable, which it was not a moment ago.
+	claimed, err := s.ClaimDueFeeds(ctx, 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(claimed) != 1 || claimed[0].ID != feed.ID {
+		t.Errorf("claimed %d feeds, want the one just activated", len(claimed))
+	}
+}
+
+func TestMarkFeedRequestedIsThrottled(t *testing.T) {
+	s, ctx := newStore(t)
+
+	feed := activeFeed(t, s, ctx, "https://example.com/feed.xml")
+	first := feed.LastRequestedAt
+	if first == nil {
+		t.Fatal("activation should have set last_requested_at")
+	}
+
+	// Within the throttle window a second request writes nothing, so a popular
+	// podcast does not take a database write on every read.
+	activated, err := s.MarkFeedRequested(ctx, feed.ID, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if activated {
+		t.Error("a feed already active and recently requested should not report activation")
+	}
+
+	after, err := s.FeedByID(ctx, feed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !after.LastRequestedAt.Equal(*first) {
+		t.Errorf("last_requested_at moved from %s to %s inside the throttle window", first, after.LastRequestedAt)
+	}
+
+	// With no throttle it does write.
+	if _, err := s.MarkFeedRequested(ctx, feed.ID, 0); err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := s.FeedByID(ctx, feed.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !refreshed.LastRequestedAt.After(*first) {
+		t.Error("last_requested_at should advance once the throttle window has passed")
+	}
+}
+
+func TestDeadFeedsAreRetriedWhenDue(t *testing.T) {
+	s, ctx := newStore(t)
+
+	feed := activeFeed(t, s, ctx, "https://example.com/gone.xml")
+
+	// Mark it dead with its recheck already due, exactly as the crawler would
+	// leave a feed whose recheck interval has elapsed.
+	feed.Status = store.StatusDead
+	feed.NextCheckAt = time.Now().Add(-time.Minute)
+	if _, err := s.ApplyCrawl(ctx, store.CrawlResult{Feed: feed}); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := s.ClaimDueFeeds(ctx, 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The claim query used to exclude dead feeds outright, so CRAWLER_DEAD_RECHECK
+	// never took effect and a feed marked dead was written off permanently.
+	if len(claimed) != 1 || claimed[0].ID != feed.ID {
+		t.Errorf("claimed %d feeds, want the dead one to be retried once its recheck came due", len(claimed))
+	}
+}
+
+func TestRedirectedFeedsAreNeverClaimed(t *testing.T) {
+	s, ctx := newStore(t)
+
+	target := activeFeed(t, s, ctx, "https://example.com/target.xml")
+	stub := activeFeed(t, s, ctx, "https://example.com/old.xml")
+
+	stub.Status = store.StatusRedirected
+	stub.RedirectedToFeedID = &target.ID
+	stub.NextCheckAt = time.Now().Add(-time.Hour)
+	if _, err := s.ApplyCrawl(ctx, store.CrawlResult{Feed: stub}); err != nil {
+		t.Fatal(err)
+	}
+
+	claimed, err := s.ClaimDueFeeds(ctx, 10, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, f := range claimed {
+		if f.ID == stub.ID {
+			t.Error("a redirect stub was claimed for crawling")
+		}
 	}
 }

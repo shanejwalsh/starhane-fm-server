@@ -138,3 +138,34 @@ func (s *Store) CountEpisodes(ctx context.Context, feedID int64) (int, error) {
 	}
 	return count, nil
 }
+
+// pruneEpisodes deletes episodes that the feed has stopped listing.
+//
+// Episodes are filtered out of responses as soon as they vanish from a feed
+// (EpisodesByFeed matches on the current crawl_seq), but without this their
+// rows lived forever — and a feed that publishes only a rolling window of
+// recent episodes would accumulate rows indefinitely.
+//
+// grace is how many crawls an episode may be absent before deletion, so a
+// single truncated or malformed document cannot erase a feed's history. A grace
+// of zero disables pruning entirely.
+func pruneEpisodes(ctx context.Context, tx pgx.Tx, feedID, crawlSeq int64, grace int) (int, error) {
+	if grace <= 0 {
+		return 0, nil
+	}
+
+	cutoff := crawlSeq - int64(grace)
+	if cutoff <= 0 {
+		// The feed has not been crawled enough times for anything to have been
+		// absent for the whole grace window.
+		return 0, nil
+	}
+
+	const query = `DELETE FROM episodes WHERE feed_id = $1 AND last_crawl_seq < $2`
+
+	tag, err := tx.Exec(ctx, query, feedID, cutoff)
+	if err != nil {
+		return 0, fmt.Errorf("pruning episodes of feed %d: %w", feedID, err)
+	}
+	return int(tag.RowsAffected()), nil
+}

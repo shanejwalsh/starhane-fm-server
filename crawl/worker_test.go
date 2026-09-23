@@ -31,7 +31,12 @@ func TestWorkerCrawlsDueFeedsAndStopsOnCancel(t *testing.T) {
 
 	const feedCount = 5
 	for range feedCount {
-		if _, err := s.UpsertFeed(ctx, srv.URL+"/"+time.Now().Format("150405.000000000")); err != nil {
+		feed, err := s.UpsertFeed(ctx, srv.URL+"/"+time.Now().Format("150405.000000000"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Seeded feeds are dormant; a request is what puts them in rotation.
+		if _, err := s.MarkFeedRequested(ctx, feed.ID, time.Hour); err != nil {
 			t.Fatal(err)
 		}
 		time.Sleep(time.Millisecond)

@@ -50,6 +50,10 @@ type fakeCatalogue struct {
 	lookupErr  error
 	episodes   []store.Episode
 	episodeErr error
+
+	requested    []int64
+	requestedErr error
+	activated    bool
 }
 
 func (f *fakeCatalogue) UpsertPodcasts(_ context.Context, podcasts []store.PodcastUpsert) error {
@@ -74,6 +78,11 @@ func (f *fakeCatalogue) PodcastWithFeedByItunesID(context.Context, int64) (store
 
 func (f *fakeCatalogue) EpisodesByFeed(context.Context, int64) ([]store.Episode, error) {
 	return f.episodes, f.episodeErr
+}
+
+func (f *fakeCatalogue) MarkFeedRequested(_ context.Context, feedID int64, _ time.Duration) (bool, error) {
+	f.requested = append(f.requested, feedID)
+	return f.activated, f.requestedErr
 }
 
 type fakeCrawler struct {
@@ -560,5 +569,53 @@ func TestSearchReportsCacheBypass(t *testing.T) {
 	// this phase, and the log should say so rather than imply a miss.
 	if summary["cache"] != "bypass" {
 		t.Errorf("cache = %v, want bypass", summary["cache"])
+	}
+}
+
+func TestGetEpisodesActivatesTheFeed(t *testing.T) {
+	catalogue := &fakeCatalogue{feed: sampleFeed(true), episodes: []store.Episode{{Guid: "a"}}}
+
+	rec := get(t, newTestHandler(&fakeItunes{}, catalogue, &fakeCrawler{}), "/api/v1/podcasts/1234567/episodes")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	// Requesting episodes is what puts a feed into the crawl rotation.
+	if len(catalogue.requested) != 1 || catalogue.requested[0] != 7 {
+		t.Errorf("marked %v as requested, want [7]", catalogue.requested)
+	}
+}
+
+func TestGetEpisodesSurvivesActivationFailure(t *testing.T) {
+	catalogue := &fakeCatalogue{
+		feed:         sampleFeed(true),
+		episodes:     []store.Episode{{Guid: "a"}},
+		requestedErr: errors.New("database is down"),
+	}
+
+	rec := get(t, newTestHandler(&fakeItunes{}, catalogue, &fakeCrawler{}), "/api/v1/podcasts/1234567/episodes")
+
+	// The caller wanted episodes, and we have them. Failing to record the
+	// request must not turn that into an error.
+	if rec.Code != http.StatusOK {
+		t.Errorf("status = %d, want 200 despite activation failing", rec.Code)
+	}
+}
+
+func TestSearchDoesNotActivateAnything(t *testing.T) {
+	ias := &fakeItunes{response: itunes.SearchResponse{ResultCount: 1, Results: []itunes.Result{sampleResult()}}}
+	catalogue := &fakeCatalogue{}
+
+	rec := get(t, newTestHandler(ias, catalogue, &fakeCrawler{}), "/api/v1/podcasts/?searchTerm=test")
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	// The whole point: a search stores metadata but schedules no crawling.
+	if len(catalogue.requested) != 0 {
+		t.Errorf("search activated feeds %v, want none", catalogue.requested)
+	}
+	if len(catalogue.upserted) != 1 {
+		t.Errorf("search should still store the podcast, upserted %d", len(catalogue.upserted))
 	}
 }

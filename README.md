@@ -9,8 +9,11 @@ The API used to download and parse a podcast's entire RSS feed on every request
 for its episodes. It no longer does. Instead:
 
 - Any podcast returned by a search or a lookup is **upserted into Postgres**
-  along with its feed URL, and that feed is scheduled for crawling. Browsing the
-  API is what fills the catalogue — nothing is seeded up front.
+  along with its feed URL. Browsing the API is what fills the catalogue —
+  nothing is seeded up front.
+- A feed is **only crawled once somebody asks for its episodes**. A search
+  returns fifty podcasts and a user opens at most one, so crawling all fifty
+  would make storage and bandwidth track impressions rather than reading.
 - A separate **crawler** service claims due feeds from Postgres and refreshes
   them: conditional GETs, per-host rate limiting, adaptive intervals.
 - `GET /api/v1/podcasts/{id}/episodes` **reads from the database**. Only if a
@@ -156,6 +159,8 @@ to its own size, so sizing can be checked from the logs.
 | `CRAWLER_DEAD_RECHECK` | `720h` | How often dead feeds are retried (30 days) |
 | `CRAWLER_LEASE_DURATION` | `15m` | How far a claim pushes a feed's next check |
 | `CRAWLER_SYNC_BUDGET` | `20s` | Cap on the API's first-request crawl |
+| `CRAWLER_EPISODE_GRACE_CRAWLS` | `5` | Crawls an episode may be absent from its feed before its row is deleted; `0` disables pruning |
+| `FEED_REQUEST_THROTTLE` | `1h` | Minimum gap between writes recording that a feed was requested |
 
 ### Tests
 
@@ -166,6 +171,23 @@ to its own size, so sizing can be checked from the logs.
 ## The crawler
 
 The crawler is a separate binary sharing packages and the database with the API.
+
+### Feed lifecycle
+
+| Status | Meaning | Crawled? |
+|---|---|---|
+| `dormant` | Seeded by a search, nobody has asked for it | no |
+| `active` | Someone requested its episodes | yes, when due |
+| `dead` | Gone, or failed too many times | yes, when its recheck comes due |
+| `redirected` | Stub pointing at a feed we already have | no |
+
+Feeds are born dormant. Requesting a podcast's episodes activates its feed and
+puts it in the rotation — that is the only thing that does. This keeps storage
+and crawl bandwidth proportional to what people actually read: a broad search
+seeds fifty podcasts for about 45KB of metadata rather than crawling fifty feeds
+for tens of megabytes of episodes nobody asked for.
+
+### Behaviour
 
 - **Postgres is the queue.** Feeds are claimed with `SELECT ... FOR UPDATE SKIP
   LOCKED`, so several crawler processes can share one queue without
@@ -182,9 +204,17 @@ The crawler is a separate binary sharing packages and the database with the API.
   stored URL. If the destination is already in the catalogue, the old row
   becomes a redirect stub instead of colliding.
 - **Failures back off.** 410 marks a feed dead at once; repeated failures do so
-  after a budget; both are then retried monthly. A 429 honours `Retry-After` and
-  does not count towards that budget — being throttled is the host working as
-  intended, not the feed being broken.
+  after a budget. A dead feed leaves the rotation but is retried when
+  `CRAWLER_DEAD_RECHECK` elapses rather than being written off, so a feed that
+  404s through a migration recovers on its own. A 429 honours `Retry-After` and
+  does not count towards the failure budget — being throttled is the host
+  working as intended, not the feed being broken.
+- **Vanished episodes are pruned.** An episode dropped from a feed stops being
+  served immediately, and its row is deleted once it has been absent for
+  `CRAWLER_EPISODE_GRACE_CRAWLS` crawls. The grace window means one truncated
+  document cannot erase a feed's history, and pruning is skipped entirely when a
+  parse yields no episodes at all — a feed that suddenly has no items is far
+  more likely broken than genuinely empty.
 - **Adaptive scheduling.** A feed that changed is re-checked at its episode
   cadence (median gap, so one ancient back-catalogue entry cannot skew it);
   a quiet one backs off gradually and an erroring one faster, both clamped.
@@ -288,9 +318,10 @@ GET /api/v1/podcasts/1234567
 
 Serve a podcast's episodes from the catalogue.
 
-If the podcast is not yet known, it is looked up on iTunes and stored. If its
-feed has never been crawled, it is crawled once, synchronously, and then served.
-Every request after that is a database read.
+If the podcast is not yet known, it is looked up on iTunes and stored. Requesting
+episodes is also what activates the feed for crawling. If the feed has never been
+crawled, it is crawled once, synchronously, and then served. Every request after
+that is a database read, kept fresh by the crawler.
 
 Episodes are returned in **feed order** — the order they appear in the RSS
 document — and `pubDate` is the feed's own date string, unparsed, both matching

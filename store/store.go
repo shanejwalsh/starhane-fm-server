@@ -13,8 +13,14 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-// Feed status values.
+// Feed status values. Together they are the feed lifecycle: a feed seen in a
+// search starts dormant and only enters the crawl rotation once somebody asks
+// for its episodes, so storage and bandwidth track what people read rather
+// than what they scrolled past.
 const (
+	// StatusDormant is a feed seeded from a search that nobody has requested.
+	// It is never crawled.
+	StatusDormant = "dormant"
 	// StatusActive is a feed that is crawled on its normal schedule.
 	StatusActive = "active"
 	// StatusDead is a feed that is gone or has failed too many times. Dead
@@ -67,6 +73,12 @@ type Feed struct {
 	Status             string `db:"status"`
 	RedirectedToFeedID *int64 `db:"redirected_to_feed_id"`
 
+	// ActivatedAt is when the feed first entered the crawl rotation, and
+	// LastRequestedAt when its episodes were last asked for. Together they say
+	// whether a feed is still worth crawling.
+	ActivatedAt     *time.Time `db:"activated_at"`
+	LastRequestedAt *time.Time `db:"last_requested_at"`
+
 	CheckInterval time.Duration `db:"check_interval"`
 	NextCheckAt   time.Time     `db:"next_check_at"`
 
@@ -86,6 +98,9 @@ type Feed struct {
 
 // NeverCrawled reports whether the feed has yet to be fetched and parsed once.
 func (f Feed) NeverCrawled() bool { return f.LastSuccessAt == nil }
+
+// Dormant reports whether the feed is waiting for someone to ask for it.
+func (f Feed) Dormant() bool { return f.Status == StatusDormant }
 
 // Podcast is a row of the podcasts table.
 type Podcast struct {

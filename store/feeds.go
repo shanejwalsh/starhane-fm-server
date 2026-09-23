@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -11,14 +12,15 @@ import (
 // feedColumns is every column Feed has a field for. RowToStructByNameLax errors
 // on a column with no matching field, so the list and the struct move together.
 const feedColumns = `id, url, etag, last_modified, body_hash, status, redirected_to_feed_id,
-	check_interval, next_check_at, consecutive_failures, last_checked_at, last_success_at,
-	last_modified_at, last_status_code, last_error, crawl_seq, created_at, updated_at`
+	activated_at, last_requested_at, check_interval, next_check_at, consecutive_failures,
+	last_checked_at, last_success_at, last_modified_at, last_status_code, last_error,
+	crawl_seq, created_at, updated_at`
 
 // UpsertFeed returns the feed for url, creating it if it is new.
 //
-// A new feed is due immediately, which is what makes the catalogue lazy: the
-// API upserts a feed as a side effect of returning a podcast, and the crawler
-// picks it up on its next pass.
+// A new feed is dormant: the API upserts one as a side effect of returning a
+// podcast, but nothing crawls it until somebody asks for its episodes. A single
+// search seeds fifty feeds and a user opens at most one of them.
 func (s *Store) UpsertFeed(ctx context.Context, url string) (Feed, error) {
 	// DO UPDATE rather than DO NOTHING so RETURNING always produces a row.
 	const query = `
@@ -50,6 +52,11 @@ func (s *Store) FeedByURL(ctx context.Context, url string) (Feed, error) {
 
 // ClaimDueFeeds takes up to limit feeds that are due for a crawl.
 //
+// Only active and dead feeds are candidates. Dormant feeds have never been
+// asked for, and redirected ones are stubs pointing elsewhere. Dead feeds are
+// included so that their scheduled re-check actually happens — they are the
+// reason CRAWLER_DEAD_RECHECK exists.
+//
 // Postgres is the queue. SKIP LOCKED lets several crawler processes claim
 // disjoint batches without coordinating, and pushing next_check_at forward by
 // lease means a worker that dies mid-crawl releases its feeds back to the queue
@@ -63,7 +70,7 @@ func (s *Store) ClaimDueFeeds(ctx context.Context, limit int, lease time.Duratio
 		WHERE id IN (
 		    SELECT id
 		    FROM feeds
-		    WHERE status <> 'dead'
+		    WHERE status IN ('active', 'dead')
 		      AND next_check_at <= now()
 		    ORDER BY next_check_at
 		    LIMIT $1
@@ -82,6 +89,41 @@ func (s *Store) ClaimDueFeeds(ctx context.Context, limit int, lease time.Duratio
 	return feeds, nil
 }
 
+// MarkFeedRequested records that somebody asked for a feed's episodes,
+// activating it if it was dormant.
+//
+// This is what puts a feed into the crawl rotation — searching for a podcast
+// does not, opening it does. throttle keeps a popular feed from taking a write
+// on every read: the statement's WHERE clause matches nothing once the feed has
+// been touched recently.
+//
+// It reports whether the feed was activated by this call.
+func (s *Store) MarkFeedRequested(ctx context.Context, feedID int64, throttle time.Duration) (bool, error) {
+	const query = `
+		UPDATE feeds
+		SET last_requested_at = now(),
+		    activated_at      = COALESCE(activated_at, now()),
+		    status            = CASE WHEN status = 'dormant' THEN 'active' ELSE status END,
+		    next_check_at     = CASE WHEN status = 'dormant' THEN now() ELSE next_check_at END,
+		    updated_at        = now()
+		WHERE id = $1
+		  AND (status = 'dormant'
+		       OR last_requested_at IS NULL
+		       OR last_requested_at < now() - $2::interval)
+		RETURNING status`
+
+	var status string
+	err := s.pool.QueryRow(ctx, query, feedID, throttle).Scan(&status)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// Already active and recently requested: nothing to do.
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("marking feed %d requested: %w", feedID, err)
+	}
+	return true, nil
+}
+
 // CrawlResult is the outcome of one crawl, ready to be persisted.
 //
 // Feed carries the already-computed next state: the crawl package owns the
@@ -93,6 +135,9 @@ type CrawlResult struct {
 	// crawl_seq and touches episodes.
 	Parsed   bool
 	Episodes []EpisodeUpsert
+	// PruneGrace is how many crawls an episode may be missing from the feed
+	// before its row is deleted. Zero disables pruning.
+	PruneGrace int
 }
 
 // ApplyCrawl writes a crawl's outcome: the feed's new state and, when the body
@@ -101,10 +146,12 @@ type CrawlResult struct {
 // It runs in one transaction so that crawl_seq and the episodes stamped with it
 // can never disagree — a reader would otherwise briefly see an episode list
 // that is empty or half-updated.
-func (s *Store) ApplyCrawl(ctx context.Context, result CrawlResult) (int, error) {
+func (s *Store) ApplyCrawl(ctx context.Context, result CrawlResult) (CrawlCounts, error) {
+	var counts CrawlCounts
+
 	tx, err := s.pool.Begin(ctx)
 	if err != nil {
-		return 0, fmt.Errorf("beginning transaction: %w", err)
+		return counts, fmt.Errorf("beginning transaction: %w", err)
 	}
 	defer tx.Rollback(ctx)
 
@@ -137,21 +184,34 @@ func (s *Store) ApplyCrawl(ctx context.Context, result CrawlResult) (int, error)
 		f.LastModifiedAt, f.LastStatusCode, f.LastError, result.Parsed,
 	).Scan(&crawlSeq)
 	if err != nil {
-		return 0, fmt.Errorf("updating feed %d: %w", f.ID, err)
+		return counts, fmt.Errorf("updating feed %d: %w", f.ID, err)
 	}
 
-	upserted := 0
 	if result.Parsed && len(result.Episodes) > 0 {
-		upserted, err = upsertEpisodes(ctx, tx, f.ID, crawlSeq, result.Episodes)
+		counts.Upserted, err = upsertEpisodes(ctx, tx, f.ID, crawlSeq, result.Episodes)
 		if err != nil {
-			return 0, err
+			return counts, err
+		}
+
+		// Prune only after a parse that actually produced episodes. A feed
+		// that suddenly has no items is far more likely broken than genuinely
+		// empty, and pruning on that would delete its whole history.
+		counts.Pruned, err = pruneEpisodes(ctx, tx, f.ID, crawlSeq, result.PruneGrace)
+		if err != nil {
+			return counts, err
 		}
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return 0, fmt.Errorf("committing crawl of feed %d: %w", f.ID, err)
+		return counts, fmt.Errorf("committing crawl of feed %d: %w", f.ID, err)
 	}
-	return upserted, nil
+	return counts, nil
+}
+
+// CrawlCounts is how many episode rows a crawl wrote and removed.
+type CrawlCounts struct {
+	Upserted int
+	Pruned   int
 }
 
 // RecentEpisodeDates returns the publication dates of a feed's most recent

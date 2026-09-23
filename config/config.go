@@ -38,8 +38,11 @@ const (
 	DefaultDeadRecheck      = 30 * 24 * time.Hour
 	DefaultLeaseDuration    = 15 * time.Minute
 
-	DefaultItunesTimeout   = 10 * time.Second
-	DefaultSyncCrawlBudget = 20 * time.Second
+	DefaultEpisodeGraceCrawls = 5
+
+	DefaultItunesTimeout       = 10 * time.Second
+	DefaultSyncCrawlBudget     = 20 * time.Second
+	DefaultFeedRequestThrottle = time.Hour
 )
 
 // Config is the whole application's configuration.
@@ -89,6 +92,15 @@ type Crawler struct {
 
 	// SyncCrawlBudget bounds the API's first-request crawl of a cold feed.
 	SyncCrawlBudget time.Duration
+
+	// EpisodeGraceCrawls is how many crawls an episode may be missing from a
+	// feed before its row is deleted. Zero disables pruning.
+	EpisodeGraceCrawls int
+
+	// FeedRequestThrottle is the minimum gap between writes recording that a
+	// feed's episodes were requested, so a popular podcast does not take a
+	// database write on every read.
+	FeedRequestThrottle time.Duration
 }
 
 // Itunes configures the upstream iTunes Search API client.
@@ -175,22 +187,31 @@ func Load() (Config, error) {
 	fail(err)
 	syncBudget, err := durationOr("CRAWLER_SYNC_BUDGET", DefaultSyncCrawlBudget)
 	fail(err)
+	graceCrawls, err := intOr("CRAWLER_EPISODE_GRACE_CRAWLS", DefaultEpisodeGraceCrawls)
+	fail(err)
+	if graceCrawls < 0 {
+		fail(fmt.Errorf("CRAWLER_EPISODE_GRACE_CRAWLS must not be negative, got %d", graceCrawls))
+	}
+	requestThrottle, err := durationOr("FEED_REQUEST_THROTTLE", DefaultFeedRequestThrottle)
+	fail(err)
 
 	cfg.Crawler = Crawler{
-		Workers:         workers,
-		BatchSize:       batchSize,
-		PollInterval:    pollInterval,
-		HTTPTimeout:     httpTimeout,
-		MaxBodyBytes:    maxBody,
-		UserAgent:       stringOr("CRAWLER_USER_AGENT", DefaultCrawlerUserAgent),
-		HostRPS:         hostRPS,
-		HostBurst:       hostBurst,
-		MinInterval:     minInterval,
-		MaxInterval:     maxInterval,
-		MaxFailures:     maxFailures,
-		DeadRecheck:     deadRecheck,
-		LeaseDuration:   lease,
-		SyncCrawlBudget: syncBudget,
+		Workers:             workers,
+		BatchSize:           batchSize,
+		PollInterval:        pollInterval,
+		HTTPTimeout:         httpTimeout,
+		MaxBodyBytes:        maxBody,
+		UserAgent:           stringOr("CRAWLER_USER_AGENT", DefaultCrawlerUserAgent),
+		HostRPS:             hostRPS,
+		HostBurst:           hostBurst,
+		MinInterval:         minInterval,
+		MaxInterval:         maxInterval,
+		MaxFailures:         maxFailures,
+		DeadRecheck:         deadRecheck,
+		LeaseDuration:       lease,
+		SyncCrawlBudget:     syncBudget,
+		EpisodeGraceCrawls:  graceCrawls,
+		FeedRequestThrottle: requestThrottle,
 	}
 
 	itunesTimeout, err := durationOr("ITUNES_TIMEOUT", DefaultItunesTimeout)
