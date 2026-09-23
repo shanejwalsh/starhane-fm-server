@@ -5,8 +5,8 @@ CREATE TABLE feeds (
     url                   text        NOT NULL UNIQUE,
 
     -- Conditional GET validators, replayed as If-None-Match / If-Modified-Since.
-    etag                  text,
-    last_modified         text,
+    etag                  text        NOT NULL DEFAULT '',
+    last_modified         text        NOT NULL DEFAULT '',
     -- sha256 of the last body we parsed. Hosts that ignore conditional GET
     -- still send a full body; comparing hashes lets us skip the parse.
     body_hash             bytea,
@@ -23,8 +23,8 @@ CREATE TABLE feeds (
     last_checked_at       timestamptz,
     last_success_at       timestamptz,
     last_modified_at      timestamptz,
-    last_status_code      integer,
-    last_error            text,
+    last_status_code      integer     NOT NULL DEFAULT 0,
+    last_error            text        NOT NULL DEFAULT '',
 
     -- Incremented on every crawl that actually parsed a body. Episodes are
     -- stamped with it, so the API can serve exactly the set of episodes the
